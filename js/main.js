@@ -207,11 +207,29 @@ function initContactLinks() {
     el.href = config.getWhatsAppUrl(msg, lang);
     el.setAttribute('target', '_blank');
     el.setAttribute('rel', 'noopener noreferrer');
+
+    if (!el.dataset.trackingAttached) {
+      el.dataset.trackingAttached = 'true';
+      el.addEventListener('click', () => {
+        if (typeof gtag === 'function') {
+          gtag('event', 'conversion', { 'send_to': 'AW-18574001849/l3JKCIbF-rgdELmN45hF' });
+        }
+      });
+    }
   });
 
   document.querySelectorAll('[data-tel-link]').forEach(el => {
     const telUrl = config.getTelUrl ? config.getTelUrl() : `tel:${localNumber}`;
     el.href = telUrl;
+
+    if (!el.dataset.trackingAttached) {
+      el.dataset.trackingAttached = 'true';
+      el.addEventListener('click', () => {
+        if (typeof gtag === 'function') {
+          gtag('event', 'conversion', { 'send_to': 'AW-18574001849/l3JKCIbF-rgdELmN45hF' });
+        }
+      });
+    }
   });
 
   document.querySelectorAll('[data-fb-link]').forEach(el => {
@@ -602,6 +620,9 @@ function initQuickInquiryForm() {
       .replace('{details}', details);
 
     const waUrl = window.SITE_CONFIG.getWhatsAppUrl(fullMessage, lang);
+    if (typeof gtag === 'function') {
+      gtag('event', 'conversion', { 'send_to': 'AW-18574001849/l3JKCIbF-rgdELmN45hF' });
+    }
     window.open(waUrl, '_blank', 'noopener,noreferrer');
   });
 }
