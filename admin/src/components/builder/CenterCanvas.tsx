@@ -62,10 +62,30 @@ export const CenterCanvas: React.FC = () => {
   // Handle bidirectional handshake and selection messages from the iframe
   useEffect(() => {
     const handleMessage = (e: MessageEvent) => {
-      if (!e.data || e.data.protocol !== 'MG_HOME_CMS_PREVIEW') return;
+      // 1. Source verification: Accept ONLY messages originating from our active iframe
+      if (iframeRef.current && e.source !== iframeRef.current.contentWindow) {
+        return;
+      }
 
+      // 2. Protocol and version schema validation
+      if (!e.data || e.data.protocol !== 'MG_HOME_CMS_PREVIEW' || e.data.version !== '2.3.0') {
+        return;
+      }
+
+      // 3. Handle Handshake
       if (e.data.type === 'MG_PREVIEW_HANDSHAKE_READY') {
         if (iframeRef.current?.contentWindow) {
+          // Send ACK
+          iframeRef.current.contentWindow.postMessage({
+            protocol: 'MG_HOME_CMS_PREVIEW',
+            version: '2.3.0',
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            type: 'MG_PREVIEW_HANDSHAKE_ACK',
+            payload: { status: 'connected' }
+          }, '*');
+
+          // Send Initial Snapshot
           iframeRef.current.contentWindow.postMessage({
             protocol: 'MG_HOME_CMS_PREVIEW',
             version: '2.3.0',
@@ -81,7 +101,7 @@ export const CenterCanvas: React.FC = () => {
           }, '*');
         }
       } else if (e.data.type === 'MG_PREVIEW_SECTION_SELECTED') {
-        if (e.data.payload?.sectionId) {
+        if (typeof e.data.payload?.sectionId === 'string') {
           selectSection(e.data.payload.sectionId);
         }
       }

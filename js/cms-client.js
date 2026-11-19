@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * MG HOME — Lightweight Public CMS Client & Visual Preview Engine (v2.3.0)
+ * MG HOME — Lightweight Public CMS Client & Visual Preview Engine (v2.3.0 Hardened)
  * File: js/cms-client.js
  * ============================================================================
  * 
@@ -11,6 +11,7 @@
  *    Falls back smoothly to static HTML on network timeout or failure.
  * 2. Visual Builder Iframe Preview Protocol:
  *    Implements MG_HOME_CMS_PREVIEW v2.3.0 postMessage protocol for live drafting.
+ *    Validates origin, source, handshake ACK, timeouts, and message schemas.
  *    Supports click-to-select, real-time section updates, and reordering.
  * 3. Analytics & Interaction Preservation:
  *    Preserves Google Tag (GTM-KVDSVFG5) and Google Ads (AW-18574001849) event
@@ -24,11 +25,25 @@
   var PROTOCOL_VERSION = '2.3.0';
   var FETCH_TIMEOUT_MS = 1500;
 
+  // Allowed parent origins for iframe postMessage communication
+  var ALLOWED_ORIGINS = [
+    window.location.origin,
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:4173',
+    'http://127.0.0.1:4173'
+  ];
+
   // Global Config with Fallback Detection
   var cmsConfig = window.MG_CMS_CONFIG || {
     supabaseUrl: (window.localStorage && localStorage.getItem('mg_supabase_url')) || '',
-    supabaseAnonKey: (window.localStorage && localStorage.getItem('mg_supabase_anon_key')) || ''
+    supabaseAnonKey: (window.localStorage && localStorage.getItem('mg_supabase_anon_key')) || '',
+    adminOrigin: (window.localStorage && localStorage.getItem('mg_admin_origin')) || ''
   };
+
+  if (cmsConfig.adminOrigin && ALLOWED_ORIGINS.indexOf(cmsConfig.adminOrigin) === -1) {
+    ALLOWED_ORIGINS.push(cmsConfig.adminOrigin);
+  }
 
   // Determine if running inside builder preview mode
   var isPreviewMode = (function () {
@@ -39,6 +54,10 @@
       return false;
     }
   })();
+
+  var previewConnected = false;
+  var handshakeTimer = null;
+  var handshakeAttempts = 0;
 
   // --------------------------------------------------------------------------
   // Helper: Get Current Language ('ar' | 'en')
@@ -68,18 +87,22 @@
       var isAr = lang === 'ar';
       var c = section.content || {};
       var badge = escapeHtml(isAr ? c.badgeAr : (c.badgeEn || c.badgeAr));
-      var titleHighlight = escapeHtml(isAr ? c.titleHighlightAr : (c.titleHighlightEn || c.titleHighlightAr));
-      var titleSuffix = escapeHtml(isAr ? c.titleSuffixAr : (c.titleSuffixEn || c.titleSuffixAr));
+      var titleHighlight = escapeHtml(isAr ? c.titleHighlightAr : (c.titleHighlightEn || c.titleHighlightAr || 'MG HOME'));
+      var titleSuffix = escapeHtml(isAr ? c.titleSuffixAr : (c.titleSuffixEn || c.titleSuffixAr || 'لجميع خدمات التكييف والصيانة'));
       var description = escapeHtml(isAr ? c.descriptionAr : (c.descriptionEn || c.descriptionAr));
-      var primaryCtaText = escapeHtml(isAr ? c.primaryCtaTextAr : (c.primaryCtaTextEn || c.primaryCtaTextAr));
-      var secondaryCtaText = escapeHtml(isAr ? c.secondaryCtaTextAr : (c.secondaryCtaTextEn || c.secondaryCtaTextAr));
-      var watermarkImg = escapeHtml(c.watermarkImage || 'assets/logo/mg-home-wave-logo.png');
+      var primaryCtaText = escapeHtml(isAr ? (c.primaryCtaTextAr || 'طلب صيانة عبر واتساب') : (c.primaryCtaTextEn || c.primaryCtaTextAr || 'Book via WhatsApp'));
+      var secondaryCtaText = escapeHtml(isAr ? (c.secondaryCtaTextAr || 'استكشف الخدمات') : (c.secondaryCtaTextEn || c.secondaryCtaTextAr || 'Explore Services'));
+      var watermarkImg = escapeHtml(c.watermarkImage || (c.floatingCard && c.floatingCard.logoImage) || 'assets/logo/mg-home-wave-logo.png');
       var visualImg = escapeHtml(c.visualImage || 'assets/maintenance/ac-split-hall-installation.jpeg');
-      var badgeTitle = escapeHtml(isAr ? c.floatingBadgeTitleAr : (c.floatingBadgeTitleEn || c.floatingBadgeTitleAr));
-      var badgeSubtitle = escapeHtml(isAr ? c.floatingBadgeSubtitleAr : (c.floatingBadgeSubtitleEn || c.floatingBadgeSubtitleAr));
+      var badgeTitle = escapeHtml(isAr ? (c.floatingBadgeTitleAr || (c.floatingCard && c.floatingCard.badgeTitleAr) || 'جودة التثبيت والتشغيل') : (c.floatingBadgeTitleEn || (c.floatingCard && c.floatingCard.badgeTitleEn) || 'Premium Installation'));
+      var badgeSubtitle = escapeHtml(isAr ? (c.floatingBadgeSubtitleAr || (c.floatingCard && c.floatingCard.badgeSubtitleAr) || 'توثيق مباشر من مواقع العمل') : (c.floatingBadgeSubtitleEn || (c.floatingCard && c.floatingCard.badgeSubtitleEn) || 'Verified On-Site Workmanship'));
 
-      var features = isAr ? (c.featuresAr || []) : (c.featuresEn || c.featuresAr || []);
-      var featuresHtml = features.map(function (feat) {
+      // Resiliently support array of objects [{ textAr, textEn }] or array of strings
+      var rawFeatures = c.features || (isAr ? c.featuresAr : c.featuresEn) || [];
+      var featuresHtml = rawFeatures.map(function (feat) {
+        var text = typeof feat === 'string' 
+          ? feat 
+          : (isAr ? (feat.textAr || feat.text) : (feat.textEn || feat.textAr || feat.text));
         return '<div class="hero-feature-item">' +
           '<div class="hero-feature-icon">' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
@@ -87,7 +110,7 @@
               '<polyline points="22 4 12 14.01 9 11.01"></polyline>' +
             '</svg>' +
           '</div>' +
-          '<span class="hero-feature-text">' + escapeHtml(feat) + '</span>' +
+          '<span class="hero-feature-text">' + escapeHtml(text) + '</span>' +
         '</div>';
       }).join('');
 
@@ -155,8 +178,8 @@
       var itemsHtml = items.map(function (item) {
         var itemTitle = escapeHtml(isAr ? item.titleAr : (item.titleEn || item.titleAr));
         var itemDesc = escapeHtml(isAr ? item.descriptionAr : (item.descriptionEn || item.descriptionAr));
-        var btnText = escapeHtml(isAr ? item.btnTextAr : (item.btnTextEn || item.btnTextAr));
-        var waService = escapeHtml(item.waService || 'default');
+        var btnText = escapeHtml(isAr ? (item.buttonTextAr || item.btnTextAr || 'طلب الخدمة') : (item.buttonTextEn || item.btnTextEn || item.buttonTextAr || 'Order Service'));
+        var waService = escapeHtml(item.serviceKey || item.waService || 'default');
 
         var bullets = isAr ? (item.bulletsAr || []) : (item.bulletsEn || item.bulletsAr || []);
         var bulletsHtml = bullets.map(function (b) {
@@ -206,9 +229,9 @@
         var tTitle = escapeHtml(isAr ? t.titleAr : (t.titleEn || t.titleAr));
         var tDesc = escapeHtml(isAr ? t.descriptionAr : (t.descriptionEn || t.descriptionAr));
         var tTag = escapeHtml(isAr ? t.tagAr : (t.tagEn || t.tagAr));
-        var tBtn = escapeHtml(isAr ? t.btnTextAr : (t.btnTextEn || t.btnTextAr));
+        var tBtn = escapeHtml(isAr ? (t.buttonTextAr || t.btnTextAr || 'طلب تسعير') : (t.buttonTextEn || t.btnTextEn || t.buttonTextAr || 'Request Quote'));
         var tImg = escapeHtml(t.image || 'assets/copper/american-copper-pipe.jpeg');
-        var waService = escapeHtml(t.waService || 'copper');
+        var waService = escapeHtml(t.waServiceKey || t.waService || 'copper');
 
         var bullets = isAr ? (t.bulletsAr || []) : (t.bulletsEn || t.bulletsAr || []);
         var bulletsHtml = bullets.map(function (b) {
@@ -232,23 +255,23 @@
         '</article>';
       }).join('');
 
-      var fieldwork = c.fieldwork || {};
-      var fieldworkBadge = escapeHtml(isAr ? fieldwork.badgeAr : (fieldwork.badgeEn || fieldwork.badgeAr));
-      var fieldworkTitle = escapeHtml(isAr ? fieldwork.titleAr : (fieldwork.titleEn || fieldwork.titleAr));
-      var fieldworkDesc = escapeHtml(isAr ? fieldwork.descriptionAr : (fieldwork.descriptionEn || fieldwork.descriptionAr));
-      var fieldworkBtn = escapeHtml(isAr ? fieldwork.btnTextAr : (fieldwork.btnTextEn || fieldwork.btnTextAr));
+      var fieldwork = c.fieldworkHeader || c.fieldwork || {};
+      var fieldworkBadge = escapeHtml(isAr ? (fieldwork.badgeAr || 'معايير التأسيس الميداني') : (fieldwork.badgeEn || fieldwork.badgeAr || 'Field Execution Standards'));
+      var fieldworkTitle = escapeHtml(isAr ? (fieldwork.titleAr || 'التأسيس الجداري واختبار الضغط الميداني') : (fieldwork.titleEn || fieldwork.titleAr || 'Wall Chasing & Pressure Testing'));
+      var fieldworkDesc = escapeHtml(isAr ? (fieldwork.subtitleAr || fieldwork.descriptionAr || 'نوثق كل مرحلة من تكسير وتمديد المسارات داخل الجدران إلى اختبار الضغط.') : (fieldwork.subtitleEn || fieldwork.descriptionEn || fieldwork.subtitleAr || 'Comprehensive on-site documentation and pressure retention testing.'));
+      var fieldworkBtn = escapeHtml(isAr ? (fieldwork.btnTextAr || 'طلب استشارة وتأسيس ميداني') : (fieldwork.btnTextEn || fieldwork.btnTextAr || 'Request Field Consultation'));
 
-      var photos = fieldwork.photos || [];
+      var photos = c.fieldworkCards || fieldwork.photos || [];
       var photosHtml = photos.map(function (p) {
         var pTitle = escapeHtml(isAr ? p.titleAr : (p.titleEn || p.titleAr));
-        var pDesc = escapeHtml(isAr ? p.descAr : (p.descEn || p.descAr));
+        var pDesc = escapeHtml(isAr ? (p.descAr || p.descriptionAr || '') : (p.descEn || p.descriptionEn || p.descAr || ''));
         var pImg = escapeHtml(p.image || '');
 
         return '<div class="copper-fieldwork-item stagger-item">' +
           '<img src="' + pImg + '" alt="' + pTitle + '" class="copper-fieldwork-img" loading="lazy" width="400" height="300" />' +
           '<div class="copper-fieldwork-caption">' +
             '<strong>' + pTitle + '</strong>' +
-            '<span>' + pDesc + '</span>' +
+            (pDesc ? '<span>' + pDesc + '</span>' : '') +
           '</div>' +
         '</div>';
       }).join('');
@@ -284,6 +307,11 @@
       var badge = escapeHtml(isAr ? c.badgeAr : (c.badgeEn || c.badgeAr));
       var title = escapeHtml(isAr ? c.titleAr : (c.titleEn || c.titleAr));
       var desc = escapeHtml(isAr ? c.descriptionAr : (c.descriptionEn || c.descriptionAr));
+
+      // Push gallery items to SITE_CONFIG so window.initGallery() renders them
+      if (Array.isArray(c.items) && c.items.length > 0 && window.SITE_CONFIG) {
+        window.SITE_CONFIG.gallery = c.items;
+      }
 
       var filters = c.categories || [
         { id: 'all', labelAr: 'الكل', labelEn: 'All' },
@@ -321,9 +349,9 @@
       var title = escapeHtml(isAr ? c.titleAr : (c.titleEn || c.titleAr));
       var desc = escapeHtml(isAr ? c.descriptionAr : (c.descriptionEn || c.descriptionAr));
       var phone = escapeHtml(c.localPhone || (window.SITE_CONFIG && window.SITE_CONFIG.contact.localNumber) || '0538061531');
-      var formTitle = escapeHtml(isAr ? c.formTitleAr : (c.formTitleEn || c.formTitleAr));
-      var formSubtitle = escapeHtml(isAr ? c.formSubtitleAr : (c.formSubtitleEn || c.formSubtitleAr));
-      var formSubmitBtn = escapeHtml(isAr ? c.formSubmitBtnAr : (c.formSubmitBtnEn || c.formSubmitBtnAr));
+      var formTitle = escapeHtml(isAr ? (c.formTitleAr || 'طلب خدمة فوري') : (c.formTitleEn || c.formTitleAr || 'Instant Service Request'));
+      var formSubtitle = escapeHtml(isAr ? (c.formSubtitleAr || 'حدد نوع الخدمة وسنقوم بتحويل طلبك فورًا لمحادثة واتساب مجهزة بالتفاصيل.') : (c.formSubtitleEn || c.formSubtitleAr || 'Select your service and your inquiry will be prepared directly in WhatsApp.'));
+      var formSubmitBtn = escapeHtml(isAr ? (c.formSubmitBtnAr || 'إرسال الطلب عبر واتساب') : (c.formSubmitBtnEn || c.formSubmitBtnAr || 'Send via WhatsApp'));
 
       return '<section class="section section-alt" id="' + escapeHtml(section.anchorId || 'contact') + '" data-section-id="' + escapeHtml(section.id) + '">' +
         '<div class="container">' +
@@ -397,8 +425,8 @@
       var c = section.content || {};
       var title = escapeHtml(isAr ? c.titleAr : (c.titleEn || c.titleAr));
       var subtitle = escapeHtml(isAr ? c.subtitleAr : (c.subtitleEn || c.subtitleAr));
-      var buttonText = escapeHtml(isAr ? c.buttonTextAr : (c.buttonTextEn || c.buttonTextAr));
-      var waService = escapeHtml(c.waService || 'default');
+      var buttonText = escapeHtml(isAr ? (c.buttonTextAr || 'تواصل معنا الآن') : (c.buttonTextEn || c.buttonTextAr || 'Contact Us Now'));
+      var waService = escapeHtml(c.waServiceKey || c.waService || 'default');
 
       return '<section class="section section-cta-banner" id="' + escapeHtml(section.anchorId || 'cta-banner') + '" data-section-id="' + escapeHtml(section.id) + '">' +
         '<div class="container">' +
@@ -450,14 +478,14 @@
       var items = c.items || [];
       var itemsHtml = items.map(function (item) {
         var name = escapeHtml(isAr ? item.clientNameAr : (item.clientNameEn || item.clientNameAr));
-        var role = escapeHtml(isAr ? item.roleAr : (item.roleEn || item.roleAr));
+        var role = escapeHtml(isAr ? (item.roleAr || item.cityAr || '') : (item.roleEn || item.cityEn || item.roleAr || ''));
         var comment = escapeHtml(isAr ? item.commentAr : (item.commentEn || item.commentAr));
         return '<div class="testimonial-card stagger-item" style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; padding: 24px; box-shadow: var(--shadow-sm);">' +
           '<div style="color: #f59e0b; font-size: 1.1rem; margin-bottom: 12px;">★★★★★</div>' +
           '<p style="color: var(--text-secondary); line-height: 1.6; margin-bottom: 16px; font-style: italic;">“' + comment + '”</p>' +
           '<div>' +
             '<strong style="display: block; color: var(--text-primary); font-size: 0.95rem;">' + name + '</strong>' +
-            '<span style="color: var(--text-muted); font-size: 0.85rem;">' + role + '</span>' +
+            (role ? '<span style="color: var(--text-muted); font-size: 0.85rem;">' + role + '</span>' : '') +
           '</div>' +
         '</div>';
       }).join('');
@@ -561,7 +589,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // Step 4: Preview Handshake & PostMessage Handling
+  // Step 4: Preview Handshake & PostMessage Handling (Origin & Source Hardened)
   // --------------------------------------------------------------------------
   function attachPreviewSelectionHandlers() {
     document.querySelectorAll('[data-section-id]').forEach(function (el) {
@@ -612,20 +640,53 @@
   }
 
   function setupPreviewProtocol() {
-    // Notify parent window that preview frame is ready
-    if (window.parent && window.parent !== window) {
-      window.parent.postMessage({
-        protocol: PROTOCOL_NAME,
-        version: PROTOCOL_VERSION,
-        type: 'MG_PREVIEW_HANDSHAKE_READY',
-        timestamp: Date.now()
-      }, '*');
+    // Notify parent window that preview frame is ready with timeout & retries
+    function sendHandshake() {
+      if (previewConnected || handshakeAttempts >= 3) return;
+      handshakeAttempts++;
+
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          protocol: PROTOCOL_NAME,
+          version: PROTOCOL_VERSION,
+          type: 'MG_PREVIEW_HANDSHAKE_READY',
+          timestamp: Date.now()
+        }, '*');
+
+        handshakeTimer = setTimeout(sendHandshake, 3500);
+      }
     }
+
+    sendHandshake();
 
     // Listen for messages from builder admin shell
     window.addEventListener('message', function (event) {
+      // 1. Source verification: MUST originate from window.parent
+      if (event.source !== window.parent) {
+        return;
+      }
+
+      // 2. Origin verification: MUST be in allowed origins list (or match current origin)
+      if (ALLOWED_ORIGINS.indexOf(event.origin) === -1 && event.origin !== 'null') {
+        console.warn('[MG CMS Preview] Blocked message from untrusted origin:', event.origin);
+        return;
+      }
+
+      // 3. Protocol and version schema verification
       var data = event.data;
-      if (!data || data.protocol !== PROTOCOL_NAME) return;
+      if (!data || data.protocol !== PROTOCOL_NAME || data.version !== PROTOCOL_VERSION) {
+        return;
+      }
+
+      // 4. Handle Handshake ACK
+      if (data.type === 'MG_PREVIEW_HANDSHAKE_ACK') {
+        previewConnected = true;
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        return;
+      }
 
       switch (data.type) {
         case 'MG_PREVIEW_INIT':
@@ -707,7 +768,7 @@
       return;
     }
 
-    var endpoint = url.replace(/\/+$/, '') + '/rest/v1/page_revisions?is_active=eq.true&select=revision_number,snapshot,published_at&limit=1';
+    var endpoint = url.replace(/\/+$/, '') + '/rest/v1/page_revisions?is_active=eq.true&select=revision_number,snapshot_data,published_at&limit=1';
     var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     var timeoutId = controller ? setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS) : null;
 
@@ -730,11 +791,12 @@
         return res.json();
       })
       .then(function (rows) {
-        if (!Array.isArray(rows) || rows.length === 0 || !rows[0].snapshot) {
+        if (!Array.isArray(rows) || rows.length === 0) {
           return;
         }
 
-        var snapshot = rows[0].snapshot;
+        var snapshot = rows[0].snapshot_data || rows[0].snapshot;
+        if (!snapshot) return;
 
         // 1. Hydrate Site Settings
         if (snapshot.site_settings && window.SITE_CONFIG) {
@@ -762,15 +824,14 @@
 
         // 3. Hydrate Sections
         if (Array.isArray(snapshot.sections) && snapshot.sections.length > 0) {
-          // Normalize section schema from snake_case snapshot if necessary
           var normalized = snapshot.sections.map(function (item) {
             return {
               id: item.id,
-              type: item.type,
-              label: item.label,
+              type: item.type || item.section_type,
+              label: item.label || item.section_label,
               anchorId: item.anchor_id || item.anchorId,
               isVisible: item.is_visible !== undefined ? item.is_visible : item.isVisible,
-              displayOrder: item.display_order !== undefined ? item.display_order : item.displayOrder,
+              displayOrder: item.display_order !== undefined ? item.display_order : (item.displayOrder !== undefined ? item.displayOrder : item.order),
               content: item.content || {},
               settings: item.settings || {}
             };
@@ -807,10 +868,12 @@
     bootstrap();
   }
 
-  // Expose API for parent window or debugging
+  // Expose API for verification, debugging and testing
   window.MG_CMS_CLIENT = {
     version: PROTOCOL_VERSION,
     isPreviewMode: isPreviewMode,
+    ALLOWED_ORIGINS: ALLOWED_ORIGINS,
+    SectionRenderers: SectionRenderers,
     renderSections: renderSections,
     reinitializePageInteractions: reinitializePageInteractions
   };
