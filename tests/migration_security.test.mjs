@@ -128,7 +128,7 @@ describe('1. Database Migration & Security Hardening Tests', () => {
       'reorder_draft_sections',
       'publish_page_revision',
       'restore_revision_to_draft',
-      'validate_and_register_media_asset'
+      'save_draft_page_transaction'
     ];
 
     for (const f of funcs) {
@@ -144,7 +144,7 @@ describe('1. Database Migration & Security Hardening Tests', () => {
       'reorder_draft_sections',
       'publish_page_revision',
       'restore_revision_to_draft',
-      'validate_and_register_media_asset'
+      'save_draft_page_transaction'
     ];
 
     for (const rpc of authenticatedRPCs) {
@@ -154,6 +154,50 @@ describe('1. Database Migration & Security Hardening Tests', () => {
         `${rpc} must have explicit GRANT EXECUTE TO authenticated`
       );
     }
+  });
+
+  it('Untrusted media registration RPC must be dropped to eliminate client bypass', () => {
+    assert.match(
+      sql,
+      /DROP FUNCTION IF EXISTS public\.validate_and_register_media_asset/i,
+      'Must drop untrusted validate_and_register_media_asset RPC'
+    );
+  });
+
+  it('Direct Storage write policies for authenticated and anon must be eliminated', () => {
+    assert.match(
+      sql,
+      /DROP POLICY IF EXISTS "media_library_admin_upload" ON storage\.objects;/i,
+      'Must drop direct upload policy on storage.objects'
+    );
+    assert.match(
+      sql,
+      /DROP POLICY IF EXISTS "media_library_admin_delete" ON storage\.objects;/i,
+      'Must drop direct delete policy on storage.objects'
+    );
+    assert.doesNotMatch(
+      sql,
+      /CREATE POLICY\s+"[^"]+"\s+ON\s+storage\.objects\s+FOR\s+INSERT\s+TO\s+authenticated/i,
+      'No INSERT policy for authenticated role may exist on storage.objects'
+    );
+    assert.doesNotMatch(
+      sql,
+      /CREATE POLICY\s+"[^"]+"\s+ON\s+storage\.objects\s+FOR\s+DELETE\s+TO\s+authenticated/i,
+      'No DELETE policy for authenticated role may exist on storage.objects'
+    );
+  });
+
+  it('Transactional save_draft_page_transaction RPC must acquire workspace advisory lock', () => {
+    assert.match(
+      sql,
+      /CREATE OR REPLACE FUNCTION public\.save_draft_page_transaction/i,
+      'Must define save_draft_page_transaction RPC'
+    );
+    assert.match(
+      sql,
+      /pg_advisory_xact_lock\(hashtext\('mg_home_cms_workspace_lock'\)\)/i,
+      'save_draft_page_transaction must acquire unified workspace advisory lock'
+    );
   });
 
   it('Automatic signup promotion trigger must be dropped to prevent public registration privilege escalation', () => {

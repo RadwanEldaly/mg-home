@@ -673,41 +673,22 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       localStorage.setItem(STORAGE_KEY_METADATA, JSON.stringify(pageMetadata));
 
       if (isSupabaseConfigured && supabase) {
-        // 1. Persist site settings (snake_case)
-        const { error: errSettings } = await supabase
-          .from('draft_site_settings')
-          .upsert(toDbSettings(siteSettings));
-        if (errSettings) throw new Error(`Site settings error: ${errSettings.message}`);
+        const payloadSettings = toDbSettings(siteSettings);
+        const payloadMetadata = toDbMetadata(pageMetadata);
+        const payloadSections = sections.map((sec, idx) => toDbSection({ ...sec, order: (idx + 1) * 10 }));
 
-        // 2. Persist page metadata (snake_case)
-        const { error: errMetadata } = await supabase
-          .from('draft_page_metadata')
-          .upsert(toDbMetadata(pageMetadata));
-        if (errMetadata) throw new Error(`Page metadata error: ${errMetadata.message}`);
+        const { data, error: txError } = await supabase.rpc('save_draft_page_transaction', {
+          p_site_settings: payloadSettings,
+          p_page_metadata: payloadMetadata,
+          p_sections: payloadSections
+        });
 
-        // 3. Persist draft page sections (handle deletes and upserts)
-        const { data: dbExisting, error: errFetch } = await supabase
-          .from('draft_page_sections')
-          .select('id');
-        if (errFetch) throw new Error(`Draft sections query error: ${errFetch.message}`);
-
-        const currentIds = new Set(sections.map(s => s.id));
-        const toDelete = (dbExisting || []).filter(r => !currentIds.has(r.id)).map(r => r.id);
-
-        if (toDelete.length > 0) {
-          const { error: errDel } = await supabase
-            .from('draft_page_sections')
-            .delete()
-            .in('id', toDelete);
-          if (errDel) throw new Error(`Failed to delete removed sections: ${errDel.message}`);
+        if (txError) {
+          throw new Error(`Transactional draft persistence failed: ${txError.message}`);
         }
 
-        const sectionRows = sections.map((sec, idx) => toDbSection({ ...sec, order: (idx + 1) * 10 }));
-        if (sectionRows.length > 0) {
-          const { error: errUpsert } = await supabase
-            .from('draft_page_sections')
-            .upsert(sectionRows);
-          if (errUpsert) throw new Error(`Failed to persist draft sections: ${errUpsert.message}`);
+        if (!data || !data.success) {
+          throw new Error('Transactional draft persistence failed to confirm database write.');
         }
       }
 

@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.3 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.4 Implementation)
 
-This repository contains the engineering implementation and security remediation of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.3).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.4).
 
 ---
 
@@ -25,7 +25,7 @@ The system strictly adheres to the approved single-page, single-admin architectu
      - **Right Inspector**: Bilingual property inspector (Arabic RTL / English LTR), styling, padding, and content editing.
    - 30-step undo/redo state stack.
    - Single-admin authentication with mandatory TOTP MFA (AAL2) — zero hardcoded credentials or local storage authorization bypasses.
-   - Draft persistence with real-time PostgreSQL synchronization.
+   - Atomic draft persistence via transactional server-side RPC `save_draft_page_transaction`.
    - Atomic publishing and full rollback/restore support.
 
 3. **Backend & Database (`supabase/migrations/`)**:
@@ -33,21 +33,22 @@ The system strictly adheres to the approved single-page, single-admin architectu
    - Complete draft and published snapshot isolation:
      - Draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) are 100% private.
      - `page_revisions` stores immutable JSONB snapshots of published states.
-     - Hardened RPCs with unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`): `publish_page_revision`, `restore_revision_to_draft`, `reorder_draft_sections`.
+     - Hardened RPCs with unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`): `save_draft_page_transaction`, `publish_page_revision`, `restore_revision_to_draft`, `reorder_draft_sections`.
      - Explicit `GRANT`/`REVOKE` matrix preventing anonymous draft leakage.
      - Single-admin database constraint enforced at schema and trigger level (`uq_admin_profiles_singleton`).
-     - Storage bucket `media-library` with MIME and path restrictions.
+     - Untrusted `validate_and_register_media_asset` RPC permanently dropped.
 
-4. **Trusted Edge Function Media Validation (`supabase/functions/validate-image/`)**:
-   - Direct-to-storage client uploads have been eliminated.
-   - Client sends multipart uploads to the server-side Edge Function with active JWT.
+4. **Storage Security Closure & Complete Write Isolation**:
+   - Direct-to-storage client uploads and mutations have been completely eliminated:
+     - All `INSERT`, `UPDATE`, and `DELETE` policies on `storage.objects` for `authenticated` and `anon` roles have been removed.
+     - Direct client upload bypasses fail with PostgreSQL RLS violation.
+   - The bucket `media-library` is configured for high-speed public CDN delivery of static assets.
+   - **Write Isolation Guarantee**: The ONLY path that can write to `media-library` is the trusted Edge Function (`validate-image`) using `service_role`.
    - The Edge Function validates:
-     - Valid user session with `super_admin` role in `admin_profiles`.
-     - Active AAL2 (TOTP MFA) session claim.
+     - Super admin role and verified AAL2 (TOTP MFA) session.
      - Binary magic bytes in server memory (`FF D8 FF` for JPEG, `89 50 4E 47` for PNG, `RIFF...WEBP` for WebP).
      - Decodes true image dimensions from chunk headers (SOF0/SOF2, IHDR, VP8/VP8L/VP8X).
-     - Rejects spoofed or malicious payloads *before* any byte touches storage.
-     - Uploads to storage using `service_role` and inserts approved record into `public.media_assets`.
+     - Rejects forged headers, oversized files (> 5MB), and corrupt payloads *before* writing to storage.
      - Automatically rolls back and deletes storage objects if database registration fails.
 
 ---
@@ -119,9 +120,7 @@ Serve the root directory with any HTTP server (e.g. `npx serve`, Live Server, or
 
 ---
 
-## 🧪 Comprehensive Test Suite (58 Tests)
-
-The test suite covers static contract analysis, pure unit tests, and integration simulations:
+## 🧪 Comprehensive Test Suite (64 Tests)
 
 ```bash
 # Run all tests
@@ -129,7 +128,25 @@ node --test tests/*.test.mjs
 ```
 
 ### Test Suites Breakdown:
-1. **`tests/integration_auth_and_mfa.test.mjs` (7 tests)**:
+1. **`tests/integration_storage_bypass_and_draft_transaction.test.mjs` (8 tests)**:
+   - Direct authenticated Storage INSERT rejection via PostgreSQL RLS.
+   - Direct RPC invocation rejection (`validate_and_register_media_asset` dropped).
+   - Forged JPEG header rejection (SOI followed by non-SOF or corrupt payload).
+   - Executable upload rejection (`MZ` header disguised as image).
+   - Unregistered object hiding via SELECT RLS policy.
+   - Failed database registration rollback (immediate storage object deletion).
+   - Successful Edge Function upload (JPEG, PNG, WebP with decoded dimensions).
+   - Unauthorized and AAL1 Edge Function request rejection.
+
+2. **`tests/integration_draft_persistence_and_locking.test.mjs` (6 tests)**:
+   - Concurrency: Unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`).
+   - Section additions and deletions synchronization.
+   - Reordering RPC validation (monotonic 10-step renumbering).
+   - Publishing snapshot captures full draft state including hidden sections.
+   - Publishing completely aborts if draft persistence fails.
+   - `save_draft_page_transaction` atomic rollback: prevents partial persistence on failure.
+
+3. **`tests/integration_auth_and_mfa.test.mjs` (7 tests)**:
    - Rejects invalid credentials.
    - Authenticates valid user at AAL1 and identifies required MFA factors.
    - Rejects invalid TOTP codes.
@@ -138,23 +155,8 @@ node --test tests/*.test.mjs
    - Rejects unauthorized users.
    - Verifies session cleanup on logout.
 
-2. **`tests/integration_draft_persistence_and_locking.test.mjs` (5 tests)**:
-   - Verifies unified workspace advisory lock (`424242`) preventing concurrent conflicting mutations.
-   - Validates section addition and deletion synchronization in the database.
-   - Tests reordering RPC enforcing sequential order values and strict validation.
-   - Verifies that published snapshots preserve both visible and hidden sections.
-   - Confirms that publishing transaction completely aborts if draft persistence fails.
-
-3. **`tests/integration_edge_function_upload.test.mjs` (6 tests)**:
-   - Rejects unauthenticated upload requests with 401.
-   - Rejects AAL1 sessions with 403 (MFA required).
-   - Rejects non-admin users with 403.
-   - Rejects spoofed executables (`MZ` header) with 422 before storage write.
-   - Successfully uploads and registers valid JPEG, PNG, and WebP images with 201.
-   - Rolls back and deletes uploaded storage objects if database registration fails.
-
-4. **`tests/migration_security.test.mjs` (10 tests)**:
-   - Validates SQL migration AST, default privilege hardening, RLS enforcement, single-admin constraints, unified locks, dropping auto-promotion triggers, and `provision_initial_admin` privileges.
+4. **`tests/migration_security.test.mjs` (13 tests)**:
+   - Validates SQL migration AST, default privilege hardening, RLS enforcement, single-admin constraints, unified locks, dropping auto-promotion triggers, `provision_initial_admin` privileges, dropping untrusted media RPC, eliminating direct storage write policies, and transactional draft RPC advisory locking.
 
 5. **`tests/media_validation.test.mjs` (7 tests)**:
    - Binary magic signature verification, MIME mismatch detection, file size limits, dimension limits.
@@ -172,3 +174,45 @@ node --test tests/*.test.mjs
 9. **`tests/snapshot_integrity.test.mjs` (8 tests)**:
    - Publishing validation (zero sections, all hidden, missing required fields).
    - Restoration resiliency against missing, null, or malformed fields.
+
+---
+
+## 📋 Explicit Staging-Only Verification Requirements
+
+> [!IMPORTANT]
+> The automated test suite validates syntax, contracts, and simulated transactional semantics. **True security approval cannot be granted based on mocked or static tests alone.** The following live tests MUST be performed on a live Supabase Staging project before production cutover:
+
+1. **Clean Database Migration Execution**:
+   - Apply `supabase/migrations/20261119000001_initial_schema_v2_3_0.sql` on a fresh Supabase PostgreSQL 15+ instance.
+   - Confirm zero syntax errors, zero missing extensions, and proper RLS enablement across all 5 CMS tables and `storage.objects`.
+
+2. **Direct Storage Upload Bypass Attempt (CLI Verification)**:
+   - Obtain an authenticated session JWT (with AAL2) for the admin.
+   - Issue a direct `POST` request to `https://<staging-project>.supabase.co/storage/v1/object/media-library/test_bypass.jpg` using `curl` with the user JWT (NOT the service role key).
+   - **Expected Result**: HTTP 400/403 with `new row violates row-level security policy for table "objects"`.
+
+3. **Direct Media RPC Attempt (CLI Verification)**:
+   - Attempt to call `POST https://<staging-project>.supabase.co/rest/v1/rpc/validate_and_register_media_asset` with the user JWT.
+   - **Expected Result**: HTTP 404 / `function public.validate_and_register_media_asset does not exist`.
+
+4. **Edge Function Live Deployment & Execution**:
+   - Deploy `validate-image` function via `supabase functions deploy validate-image`.
+   - Set function secret: `supabase secrets set SUPABASE_SERVICE_ROLE_KEY=...`.
+   - Upload a test JPEG photo through the Admin Studio.
+   - Confirm:
+     - HTTP 201 response.
+     - Object appears in Supabase Storage under `uploads/<timestamp>_filename.jpg`.
+     - Asset record appears in table `public.media_assets`.
+
+5. **Live TOTP MFA Physical Enrollment**:
+   - Perform user sign-up and `provision_initial_admin` execution.
+   - Log in to the Admin Studio on Staging.
+   - Scan QR code using Google Authenticator on a physical mobile device.
+   - Confirm TOTP verification code upgrades session to AAL2.
+
+6. **Live End-to-End Visual Builder Publish Flow**:
+   - Open Visual Builder, edit Hero section title and background.
+   - Click "Save Draft", verify atomic persistence in database.
+   - Click "Publish", verify new active revision created in `page_revisions`.
+   - Open public website in an incognito window without login, verify updated title loads within 1500ms.
+   - Verify GTM container (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`) fire correctly.

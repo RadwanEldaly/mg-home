@@ -856,120 +856,144 @@ BEGIN
 END;
 $$;
 
--- Step 19: Trusted Server-Side Image Magic Number & Signature Validation RPC
-CREATE OR REPLACE FUNCTION public.validate_and_register_media_asset(
-    p_file_name TEXT,
-    p_storage_path TEXT,
-    p_public_url TEXT,
-    p_mime_type TEXT,
-    p_file_size_bytes INTEGER,
-    p_header_bytes BYTEA,
-    p_width INTEGER,
-    p_height INTEGER,
-    p_alt_ar TEXT DEFAULT '',
-    p_alt_en TEXT DEFAULT '',
-    p_category TEXT DEFAULT 'general'
+-- Step 19: Atomic Transactional Server-Side Draft Persistence RPC
+-- Encapsulates draft_site_settings, draft_page_metadata, and draft_page_sections
+-- in a single atomic transaction under the unified workspace advisory lock.
+DROP FUNCTION IF EXISTS public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT);
+
+CREATE OR REPLACE FUNCTION public.save_draft_page_transaction(
+    p_site_settings JSONB,
+    p_page_metadata JSONB,
+    p_sections JSONB
 )
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, public, pg_temp
+SET search_path = pg_catalog, public, auth, pg_temp
 AS $$
 DECLARE
-    v_new_id UUID;
-    v_is_valid_magic BOOLEAN := false;
+    v_section JSONB;
+    v_section_id UUID;
+    v_new_ids UUID[] := '{}';
+    v_order INTEGER := 10;
+    v_count INTEGER := 0;
 BEGIN
-    -- 1. Check Admin AAL2 session
+    -- 1. Authorization: verify super_admin AAL2 session
     IF NOT public.is_admin_aal2() THEN
-        RAISE EXCEPTION 'ACCESS DENIED: Media registration requires an active AAL2 administrative session.'
+        RAISE EXCEPTION 'ACCESS DENIED: Saving drafts requires an active AAL2 administrative session.'
             USING ERRCODE = '42501';
     END IF;
 
-    -- 2. Validate storage path pattern
-    IF p_storage_path IS NULL OR NOT (p_storage_path ~ '^uploads/[a-zA-Z0-9_\-\.]+\.(webp|jpe?g|png)$') THEN
-        RAISE EXCEPTION 'VALIDATION ERROR: Invalid storage path. Must match uploads/<filename>.<ext>.'
+    -- 2. Concurrency: acquire the unified workspace advisory transaction lock
+    PERFORM pg_advisory_xact_lock(hashtext('mg_home_cms_workspace_lock'));
+
+    -- 3. Validate input shapes
+    IF p_site_settings IS NULL OR jsonb_typeof(p_site_settings) != 'object' THEN
+        RAISE EXCEPTION 'VALIDATION ERROR: site_settings must be a non-null JSON object.'
             USING ERRCODE = '22000';
     END IF;
 
-    -- 3. Validate file size (1 byte to 5MB)
-    IF p_file_size_bytes IS NULL OR p_file_size_bytes <= 0 OR p_file_size_bytes > 5242880 THEN
-        RAISE EXCEPTION 'VALIDATION ERROR: File size must be between 1 byte and 5MB (got % bytes).'
+    IF p_page_metadata IS NULL OR jsonb_typeof(p_page_metadata) != 'object' THEN
+        RAISE EXCEPTION 'VALIDATION ERROR: page_metadata must be a non-null JSON object.'
             USING ERRCODE = '22000';
     END IF;
 
-    -- 4. Validate image dimensions (1px to 8192px)
-    IF p_width IS NULL OR p_width <= 0 OR p_width > 8192 OR
-       p_height IS NULL OR p_height <= 0 OR p_height > 8192 THEN
-        RAISE EXCEPTION 'VALIDATION ERROR: Image dimensions must be between 1x1 and 8192x8192.'
+    IF p_sections IS NULL OR jsonb_typeof(p_sections) != 'array' THEN
+        RAISE EXCEPTION 'VALIDATION ERROR: sections must be a JSON array.'
             USING ERRCODE = '22000';
     END IF;
 
-    -- 5. Binary Magic Number Signature Verification
-    -- JPEG: starts with 0xFF 0xD8 0xFF
-    -- PNG:  starts with 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A
-    -- WebP: starts with 0x52 0x49 0x46 0x46 (RIFF), followed by 4 bytes size, then 0x57 0x45 0x42 0x50 (WEBP)
-    IF p_header_bytes IS NULL OR length(p_header_bytes) < 12 THEN
-        RAISE EXCEPTION 'VALIDATION ERROR: Binary header bytes (at least 12 bytes) required for signature verification.'
-            USING ERRCODE = '22000';
-    END IF;
+    -- 4. Atomically update draft_site_settings (id = 1)
+    UPDATE public.draft_site_settings
+    SET
+        business_name_ar = COALESCE(NULLIF(TRIM(p_site_settings->>'business_name_ar'), ''), business_name_ar),
+        business_name_en = COALESCE(NULLIF(TRIM(p_site_settings->>'business_name_en'), ''), business_name_en),
+        local_phone = COALESCE(NULLIF(TRIM(p_site_settings->>'local_phone'), ''), local_phone),
+        country_code = COALESCE(NULLIF(TRIM(p_site_settings->>'country_code'), ''), country_code),
+        is_country_code_confirmed = COALESCE((p_site_settings->>'is_country_code_confirmed')::boolean, is_country_code_confirmed),
+        instagram_url = COALESCE(NULLIF(TRIM(p_site_settings->>'instagram_url'), ''), instagram_url),
+        instagram_handle = COALESCE(NULLIF(TRIM(p_site_settings->>'instagram_handle'), ''), instagram_handle),
+        facebook_url = COALESCE(NULLIF(TRIM(p_site_settings->>'facebook_url'), ''), facebook_url),
+        service_messages_ar = COALESCE(CASE WHEN jsonb_typeof(p_site_settings->'service_messages_ar') = 'object' THEN p_site_settings->'service_messages_ar' ELSE NULL END, service_messages_ar),
+        service_messages_en = COALESCE(CASE WHEN jsonb_typeof(p_site_settings->'service_messages_en') = 'object' THEN p_site_settings->'service_messages_en' ELSE NULL END, service_messages_en),
+        updated_at = TIMEZONE('utc', NOW())
+    WHERE id = 1;
 
-    IF p_mime_type = 'image/jpeg' THEN
-        -- Check JPEG SOI marker: FF D8 FF
-        IF substring(p_header_bytes from 1 for 3) = E'\\xFF\\xD8\\xFF'::bytea THEN
-            v_is_valid_magic := true;
+    -- 5. Atomically update draft_page_metadata (id = 1)
+    UPDATE public.draft_page_metadata
+    SET
+        title_ar = COALESCE(NULLIF(TRIM(p_page_metadata->>'title_ar'), ''), title_ar),
+        title_en = COALESCE(NULLIF(TRIM(p_page_metadata->>'title_en'), ''), title_en),
+        meta_description_ar = COALESCE(NULLIF(TRIM(p_page_metadata->>'meta_description_ar'), ''), meta_description_ar),
+        meta_description_en = COALESCE(NULLIF(TRIM(p_page_metadata->>'meta_description_en'), ''), meta_description_en),
+        og_image_url = COALESCE(NULLIF(TRIM(p_page_metadata->>'og_image_url'), ''), og_image_url),
+        updated_at = TIMEZONE('utc', NOW())
+    WHERE id = 1;
+
+    -- 6. Collect incoming section IDs for reconciliation
+    FOR v_section IN SELECT * FROM jsonb_array_elements(p_sections)
+    LOOP
+        IF v_section->>'id' IS NOT NULL AND v_section->>'id' ~ '^[0-9a-fA-F-]{36}$' THEN
+            v_new_ids := array_append(v_new_ids, (v_section->>'id')::uuid);
         END IF;
-    ELSIF p_mime_type = 'image/png' THEN
-        -- Check PNG signature: 89 50 4E 47 0D 0A 1A 0A
-        IF substring(p_header_bytes from 1 for 8) = E'\\x89PNG\\r\\n\\x1a\\n'::bytea THEN
-            v_is_valid_magic := true;
-        END IF;
-    ELSIF p_mime_type = 'image/webp' THEN
-        -- Check RIFF header and WEBP chunk type
-        IF substring(p_header_bytes from 1 for 4) = E'RIFF'::bytea AND
-           substring(p_header_bytes from 9 for 4) = E'WEBP'::bytea THEN
-            v_is_valid_magic := true;
-        END IF;
+    END LOOP;
+
+    -- 7. Atomically delete sections removed in the UI
+    IF array_length(v_new_ids, 1) > 0 THEN
+        DELETE FROM public.draft_page_sections
+        WHERE id != ALL(v_new_ids);
     ELSE
-        RAISE EXCEPTION 'VALIDATION ERROR: Unsupported MIME type %. Allowed: image/jpeg, image/png, image/webp.', p_mime_type
-            USING ERRCODE = '22000';
+        DELETE FROM public.draft_page_sections;
     END IF;
 
-    IF NOT v_is_valid_magic THEN
-        RAISE EXCEPTION 'SECURITY ERROR: File magic header signature does not match claimed MIME type %.', p_mime_type
-            USING ERRCODE = '22000';
-    END IF;
+    -- 8. Atomically upsert sections with validated sequential ordering
+    FOR v_section IN SELECT * FROM jsonb_array_elements(p_sections)
+    LOOP
+        IF v_section->>'id' IS NOT NULL AND v_section->>'id' ~ '^[0-9a-fA-F-]{36}$' THEN
+            v_section_id := (v_section->>'id')::uuid;
+        ELSE
+            v_section_id := uuid_generate_v4();
+        END IF;
 
-    -- 6. Insert verified media record
-    INSERT INTO public.media_assets (
-        file_name,
-        storage_path,
-        public_url,
-        mime_type,
-        file_size_bytes,
-        width,
-        height,
-        alt_ar,
-        alt_en,
-        category
-    ) VALUES (
-        p_file_name,
-        p_storage_path,
-        p_public_url,
-        p_mime_type,
-        p_file_size_bytes,
-        p_width,
-        p_height,
-        COALESCE(p_alt_ar, ''),
-        COALESCE(p_alt_en, ''),
-        COALESCE(p_category, 'general')
-    ) RETURNING id INTO v_new_id;
+        INSERT INTO public.draft_page_sections (
+            id,
+            section_type,
+            section_label,
+            display_order,
+            is_visible,
+            anchor_id,
+            content,
+            settings,
+            updated_at
+        ) VALUES (
+            v_section_id,
+            v_section->>'section_type',
+            COALESCE(NULLIF(TRIM(v_section->>'section_label'), ''), 'Section ' || (v_count + 1)),
+            v_order,
+            COALESCE((v_section->>'is_visible')::boolean, true),
+            LOWER(REGEXP_REPLACE(COALESCE(NULLIF(TRIM(v_section->>'anchor_id'), ''), 'sec-' || SUBSTRING(uuid_generate_v4()::text, 1, 8)), '[^a-z0-9-]', '-', 'g')),
+            COALESCE(CASE WHEN jsonb_typeof(v_section->'content') = 'object' THEN v_section->'content' ELSE NULL END, '{}'::jsonb),
+            COALESCE(CASE WHEN jsonb_typeof(v_section->'settings') = 'object' THEN v_section->'settings' ELSE NULL END, '{"backgroundVariant": "default", "paddingTop": "medium", "paddingBottom": "medium"}'::jsonb),
+            TIMEZONE('utc', NOW())
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            section_type = EXCLUDED.section_type,
+            section_label = EXCLUDED.section_label,
+            display_order = EXCLUDED.display_order,
+            is_visible = EXCLUDED.is_visible,
+            anchor_id = EXCLUDED.anchor_id,
+            content = EXCLUDED.content,
+            settings = EXCLUDED.settings,
+            updated_at = TIMEZONE('utc', NOW());
+
+        v_order := v_order + 10;
+        v_count := v_count + 1;
+    END LOOP;
 
     RETURN jsonb_build_object(
         'success', true,
-        'asset_id', v_new_id,
-        'storage_path', p_storage_path,
-        'public_url', p_public_url,
-        'verified_mime_type', p_mime_type
+        'sections_persisted', v_count,
+        'updated_at', TIMEZONE('utc', NOW())
     );
 END;
 $$;
@@ -995,10 +1019,24 @@ GRANT EXECUTE ON FUNCTION public.publish_page_revision(TEXT) TO authenticated;
 REVOKE ALL ON FUNCTION public.restore_revision_to_draft(UUID) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.restore_revision_to_draft(UUID) TO authenticated;
 
-REVOKE ALL ON FUNCTION public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT) TO authenticated, service_role;
+REVOKE ALL ON FUNCTION public.save_draft_page_transaction(JSONB, JSONB, JSONB) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.save_draft_page_transaction(JSONB, JSONB, JSONB) TO authenticated;
 
--- Step 21: Storage Bucket Configuration
+-- Step 21: Storage Bucket Configuration & Complete Write Isolation
+--
+-- SECURITY ARCHITECTURE NOTICE:
+-- 1. The 'media-library' bucket serves public images for the public static website.
+-- 2. Because Supabase public buckets serve CDN requests without checking RLS,
+--    protection is achieved by COMPLETE WRITE ISOLATION:
+--    - ALL INSERT, UPDATE, and DELETE policies for authenticated and anon roles
+--      are DROPPED and PROHIBITED.
+--    - No client (even an authenticated admin with AAL2) can write to storage.objects directly.
+--    - The ONLY authorized writer is the trusted server-side Edge Function (validate-image)
+--      which runs with service_role (bypassing RLS).
+--    - The Edge Function validates file bytes, magic numbers, and dimensions IN MEMORY
+--      before any byte touches storage.
+--    - If DB registration fails, the Edge Function deletes the object immediately.
+--    - Therefore, unvalidated or unregistered objects CANNOT enter or remain in the public namespace.
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES (
     'media-library',
@@ -1011,6 +1049,12 @@ ON CONFLICT (id) DO UPDATE SET
     allowed_mime_types = ARRAY['image/webp', 'image/jpeg', 'image/png'],
     file_size_limit = 5242880;
 
+-- Drop all direct write policies to eliminate direct upload/mutation bypass
+DROP POLICY IF EXISTS "media_library_admin_upload" ON storage.objects;
+DROP POLICY IF EXISTS "media_library_admin_update" ON storage.objects;
+DROP POLICY IF EXISTS "media_library_admin_delete" ON storage.objects;
+
+-- Read policy for PostgREST queries on storage.objects (returns only registered media assets)
 DROP POLICY IF EXISTS "media_library_public_read" ON storage.objects;
 CREATE POLICY "media_library_public_read"
 ON storage.objects FOR SELECT
@@ -1021,22 +1065,4 @@ USING (
         SELECT 1 FROM public.media_assets
         WHERE storage_path = name
     )
-);
-
-DROP POLICY IF EXISTS "media_library_admin_upload" ON storage.objects;
-CREATE POLICY "media_library_admin_upload"
-ON storage.objects FOR INSERT
-TO authenticated
-WITH CHECK (
-    bucket_id = 'media-library' 
-    AND public.is_admin_aal2()
-);
-
-DROP POLICY IF EXISTS "media_library_admin_delete" ON storage.objects;
-CREATE POLICY "media_library_admin_delete"
-ON storage.objects FOR DELETE
-TO authenticated
-USING (
-    bucket_id = 'media-library' 
-    AND public.is_admin_aal2()
 );
