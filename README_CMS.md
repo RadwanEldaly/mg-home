@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.7 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.8 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.7: Staging Test Harness Hardening).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.8: Final Staging Safety & Verification Hardening).
 
 ---
 
@@ -211,7 +211,7 @@ Serve the root directory with any HTTP server (e.g. `npx serve`, Live Server, or
 
 ---
 
-## 🧪 Automated Test Suite (67 Tests) & Test Classifications
+## 🧪 Automated Test Suite (79 Tests across 10 Suites) & Test Classifications
 
 ```bash
 # Run all automated tests
@@ -226,7 +226,8 @@ node --test tests/*.test.mjs
 > - **Category 1: Static SQL AST & Migration Contract Tests (13 tests)**
 > - **Category 2: Pure Unit & Binary Parser Tests (20 tests)**
 > - **Category 3: Simulated Interface & State Contract Tests (34 tests)**
-> - **Category 4: Live Staging Integration Test Suite (`scripts/verify_staging_integration.mjs`)**
+> - **Category 4: Staging Safety Guards & Harness Unit Tests (12 tests)**
+> - **Category 5: Live Staging Integration Test Suite (`scripts/verify_staging_integration.mjs`)**
 
 #### Category 1: Static SQL AST & Migration Contract Tests (13 tests)
 *File: `tests/migration_security.test.mjs`*
@@ -250,12 +251,19 @@ node --test tests/*.test.mjs
 - **Section Reordering Logic (5 tests)**: Reorder array validation (no nulls, no duplicates, no unknown IDs, no omitted IDs, monotonic 10-step permutation generation).
 
 #### Category 3: Simulated Interface & State Contract Tests (34 tests)
-*Files: `tests/integration_edge_function_upload.test.mjs` (11 tests), `tests/integration_draft_persistence_and_locking.test.mjs` (6 tests), `tests/integration_auth_and_mfa.test.mjs` (7 tests), `tests/snapshot_integrity.test.mjs` (8 tests), plus subtests*
+*Files: `tests/integration_edge_function_upload.test.mjs` (11 tests), `tests/integration_draft_persistence_and_locking.test.mjs` (6 tests), `tests/integration_auth_and_mfa.test.mjs` (7 tests), `tests/snapshot_integrity.test.mjs` (8 tests)*
 - **MFA Consistency & Parity (5 tests)**: Rejection of invalid/expired session (401), rejection of AAL1 session (403), rejection of AAL2 session lacking verified TOTP factor (403), rejection of non-admin user (403), acceptance of AAL2 with verified TOTP factor and `super_admin` profile (201).
 - **Storage & RPC Bypass Closure (6 tests)**: Rejection of direct client Storage INSERT via RLS, rejection of dropped `validate_and_register_media_asset` RPC, rejection of forged JPEG SOI headers, rejection of disguised executables, hiding of unindexed objects via SELECT RLS, rollback of storage object on simulated DB insert failure.
 - **Draft Persistence & Locking Contract (6 tests)**: Concurrency lock serialization, section additions and deletions sync, reordering RPC sequential ordering, full draft snapshot capture (including hidden sections), abort on persistence failure, atomic draft save contract.
 - **Supabase Auth & Session Lifecycle (7 tests)**: Invalid credential rejection, AAL1 authentication & MFA factor detection, invalid TOTP code rejection, session upgrade to AAL2, `super_admin` role validation, non-admin rejection, session clearance on logout.
 - **Snapshot Publishing & Restoration Resiliency (8 tests)**: Publishing validation (zero sections, all hidden, missing phone, missing Arabic title), restoration resiliency against null, missing, or malformed fields.
+
+#### Category 4: Staging Safety Guards & Harness Unit Tests (12 tests)
+*File: `tests/staging_safety_and_harness.test.mjs`*
+- **Staging Allowlist & Anti-Production Guards (4 tests)**: Rejection of production project references, rejection of unknown arbitrary projects, strict enforcement of `STAGING_PROJECT_ALLOWLIST`, acceptance of valid staging/dev references.
+- **Codebase Static Asset Scanner Fail-Closed (2 tests)**: Fails closed when repository root is missing or unverified, protects full paths and basenames from `index.html`, `js/`, `css/`.
+- **Staging Report Tracker & Non-Zero Exit Code Policy (4 tests)**: Asserts exit code 1 when configurations are missing, asserts exit code 1 when any test is skipped, asserts exit code 1 when any test fails, asserts exit code 0 strictly on 100% pass rate.
+- **RFC 6238 TOTP Generator (2 tests)**: Validates base32 decoding against RFC 4648 test vector and rejects invalid characters, validates 6-digit numeric TOTP code generation consistency.
 
 ---
 
@@ -277,13 +285,20 @@ node scripts/verify_staging_integration.mjs
 ```
 
 This live script automatically executes:
-1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects`.
+1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects` with explicit RLS error verification.
 2. **Anonymous Access Rejection**: Asserts unauthenticated requests to `is_admin_aal2()` return `false` and draft mutations fail.
 3. **Dropped RPC Non-Existence (HTTP 404)**: Confirms `validate_and_register_media_asset` is completely dropped from PostgreSQL.
 4. **Live AAL1 Session Rejection**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction`.
 5. **Real TOTP Challenge & Authentic AAL2 Upgrade**: Generates real RFC 6238 TOTP 6-digit codes to verify MFA challenge and obtain authentic AAL2 JWT from Supabase GoTrue.
 6. **Authentic is_admin_aal2() Approval**: Confirms super_admin with verified AAL2 session returns `true`.
-7. **Real PostgreSQL ACID Rollback under Authentic Admin AAL2 Session**: Submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws an exception, and verifies that `draft_site_settings` reverted to its baseline with zero partial mutation.
+7. **Real PostgreSQL ACID Rollback under Authentic Admin AAL2 Session**: Submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws an exception (`22000` / `VALIDATION ERROR`), and verifies that all three draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) reverted to their baseline snapshots with zero partial mutation.
+8. **Live Edge Function HTTP Suite (`validate-image`)**:
+   - Asserts HTTP 401 on missing auth.
+   - Asserts HTTP 403 on AAL1 session.
+   - Asserts HTTP 201 and asset registration on valid JPEG upload.
+   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and verifies zero storage object created.
+   - Cleans up only test artifacts created during the run.
+9. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED` and exits with non-zero code if any test fails, is skipped, or is unconfigured.
 
 ### 2. Manual Staging Verification Checklist
 Before production cutover, perform these physical verification steps on Staging:
