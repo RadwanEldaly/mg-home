@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.6 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.7 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.6: Final Security Corrections & Real Integration Verification).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.7: Staging Test Harness Hardening).
 
 ---
 
@@ -135,19 +135,23 @@ WHERE bucket_id = 'media-library'
 > 
 > Per official Supabase documentation, storage object deletion MUST be performed through the **Supabase Storage API** (`supabase.storage.from('media-library').remove([paths])`).
 
-#### Method A: Using the Automated Staging Cleanup Tool
-A safe, dedicated Node.js cleanup script is provided at [`scripts/cleanup_orphaned_media.mjs`](scripts/cleanup_orphaned_media.mjs):
+#### Method A: Using the Hardened Staging Cleanup Tool
+A hardened, safe Node.js cleanup script is provided at [`scripts/cleanup_orphaned_media.mjs`](scripts/cleanup_orphaned_media.mjs) featuring:
+- **Full Pagination**: Fetches all storage objects and database records in batches without limits.
+- **Programmatic Anti-Production Guard**: Requires explicit `--confirm-staging-project=<project-ref>` matching the domain of `SUPABASE_URL`.
+- **Static Codebase Protection**: Scans `index.html` to protect referenced static assets (e.g. `Img/hero-bg.webp`) from being deleted.
+- **Candidate Report Export**: Exports `staging_orphaned_report_<timestamp>.json` prior to deletion.
 
 ```bash
-# Step 1: Run audit (Dry Run - no deletions performed)
+# Step 1: Run audit & generate candidate report (Dry Run - zero deletions)
 SUPABASE_URL=https://<staging-ref>.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
 node scripts/cleanup_orphaned_media.mjs
 
-# Step 2: Review candidate files, then execute safe deletion via Storage API
+# Step 2: Inspect generated JSON report, then execute safe deletion via Storage API
 SUPABASE_URL=https://<staging-ref>.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
-node scripts/cleanup_orphaned_media.mjs --delete
+node scripts/cleanup_orphaned_media.mjs --delete --confirm-staging-project=<staging-ref>
 ```
 
 #### Method B: Manual Supabase Storage API Deletion
@@ -259,23 +263,27 @@ node --test tests/*.test.mjs
 
 For real end-to-end integration verification on a live Supabase Staging environment (verifying real PostgreSQL 15+ engine evaluation, real GoTrue cryptographic JWT signatures, and live Edge Function execution):
 
-### 1. Automated Staging Verification Suite
+### 1. Hardened Staging Verification Suite
 Execute the dedicated staging test runner at [`scripts/verify_staging_integration.mjs`](scripts/verify_staging_integration.mjs):
 
 ```bash
-STAGING_SUPABASE_URL=https://<your-staging-project>.supabase.co \
-STAGING_SERVICE_ROLE_KEY=<your-service-role-secret> \
-STAGING_SUPABASE_ANON_KEY=<your-anon-key> \
+STAGING_SUPABASE_URL=https://<staging-ref>.supabase.co \
+STAGING_SUPABASE_ANON_KEY=<valid-anon-key> \
+STAGING_SERVICE_ROLE_KEY=<service-role-secret> \
+STAGING_ADMIN_EMAIL=admin@mg-home.online \
+STAGING_ADMIN_PASSWORD=SecretPassword123! \
+STAGING_ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP \
 node scripts/verify_staging_integration.mjs
 ```
 
 This live script automatically executes:
-1. Live PostgreSQL connection and schema verification.
-2. Direct client storage upload rejection via real PostgreSQL RLS.
-3. Verification that dropped RPC `validate_and_register_media_asset` does not exist on PostgreSQL (HTTP 404).
-4. Real PostgreSQL ACID transaction rollback during `save_draft_page_transaction` when provided malformed section data.
-5. Real PostgreSQL section reordering monotonic constraint enforcement.
-6. Strict fail-closed `is_admin_aal2()` check (confirming unauthenticated users return `false`).
+1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects`.
+2. **Anonymous Access Rejection**: Asserts unauthenticated requests to `is_admin_aal2()` return `false` and draft mutations fail.
+3. **Dropped RPC Non-Existence (HTTP 404)**: Confirms `validate_and_register_media_asset` is completely dropped from PostgreSQL.
+4. **Live AAL1 Session Rejection**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction`.
+5. **Real TOTP Challenge & Authentic AAL2 Upgrade**: Generates real RFC 6238 TOTP 6-digit codes to verify MFA challenge and obtain authentic AAL2 JWT from Supabase GoTrue.
+6. **Authentic is_admin_aal2() Approval**: Confirms super_admin with verified AAL2 session returns `true`.
+7. **Real PostgreSQL ACID Rollback under Authentic Admin AAL2 Session**: Submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws an exception, and verifies that `draft_site_settings` reverted to its baseline with zero partial mutation.
 
 ### 2. Manual Staging Verification Checklist
 Before production cutover, perform these physical verification steps on Staging:
@@ -291,31 +299,6 @@ Before production cutover, perform these physical verification steps on Staging:
    - Upload a test photo through Admin Studio and verify HTTP 201 response and object creation in storage.
 5. **Orphaned Storage Audit & Cleanup**:
    - Run `node scripts/cleanup_orphaned_media.mjs` against Staging to ensure zero orphaned files exist.
-
-2. **Direct Storage Upload Bypass Attempt (CLI Verification)**:
-   - Obtain an authenticated session JWT (with AAL2) for the admin.
-   - Issue a direct `POST` request to `https://<staging-project>.supabase.co/storage/v1/object/media-library/test_bypass.jpg` using `curl` with the user JWT (NOT the service role key).
-   - **Expected Result**: HTTP 400/403 with `new row violates row-level security policy for table "objects"`.
-
-3. **Direct Media RPC Attempt (CLI Verification)**:
-   - Attempt to call `POST https://<staging-project>.supabase.co/rest/v1/rpc/validate_and_register_media_asset` with the user JWT.
-   - **Expected Result**: HTTP 404 / `function public.validate_and_register_media_asset does not exist`.
-
-4. **Edge Function Live Deployment & Execution**:
-   - Deploy `validate-image` function via `supabase functions deploy validate-image`.
-   - Set function secret: `supabase secrets set SUPABASE_SERVICE_ROLE_KEY=...`.
-   - Upload a test JPEG photo through the Admin Studio.
-   - Confirm:
-     - HTTP 201 response.
-     - Object appears in Supabase Storage under `uploads/<timestamp>_filename.jpg`.
-     - Asset record appears in table `public.media_assets`.
-
-5. **Live TOTP MFA Physical Enrollment**:
-   - Perform user sign-up and `provision_initial_admin` execution.
-   - Log in to the Admin Studio on Staging.
-   - Scan QR code using Google Authenticator on a physical mobile device.
-   - Confirm TOTP verification code upgrades session to AAL2.
-
 6. **Live End-to-End Visual Builder Publish Flow**:
    - Open Visual Builder, edit Hero section title and background.
    - Click "Save Draft", verify atomic persistence in database.
