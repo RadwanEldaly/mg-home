@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.5 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.6 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.5: MFA Consistency & Public Storage Audit).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.6: Final Security Corrections & Real Integration Verification).
 
 ---
 
@@ -37,6 +37,7 @@ The system strictly adheres to the approved single-page, single-admin architectu
      - Explicit `GRANT`/`REVOKE` matrix preventing anonymous draft leakage.
      - Single-admin database constraint enforced at schema and trigger level (`uq_admin_profiles_singleton`).
      - Untrusted `validate_and_register_media_asset` RPC permanently dropped.
+     - **Strict Fail-Closed Helper `public.is_admin_aal2()`**: Queries `auth.mfa_factors` directly for `factor_type = 'totp'` AND `status = 'verified'` with zero fallback to AMR array or regex matching on JWT strings.
 
 4. **Storage Security Closure, MFA Parity & Complete Write Isolation**:
    - Direct-to-storage client uploads and mutations have been completely eliminated:
@@ -127,27 +128,49 @@ WHERE bucket_id = 'media-library'
   );
 ```
 
-### 3. Safe Staging Cleanup Procedure (Staging Only)
+### 3. Safe Staging Cleanup Procedure (Storage API)
 > [!CAUTION]
-> **STAGING ENVIRONMENT ONLY**: Never execute mass deletion scripts on production without first verifying if existing legacy pages reference static paths!
+> **WHY DIRECT SQL `DELETE FROM storage.objects` IS STRICTLY PROHIBITED**:
+> In Supabase Storage, deleting records directly from `storage.objects` via SQL removes only the PostgreSQL metadata row. It **does NOT delete the underlying physical binary files** from the storage backend (S3/GCS bucket). This causes physical files to become permanently stranded/orphaned on disk and desynchronizes Supabase Storage metadata.
+> 
+> Per official Supabase documentation, storage object deletion MUST be performed through the **Supabase Storage API** (`supabase.storage.from('media-library').remove([paths])`).
 
-To clean up all untrusted, unindexed, or test files on Staging:
+#### Method A: Using the Automated Staging Cleanup Tool
+A safe, dedicated Node.js cleanup script is provided at [`scripts/cleanup_orphaned_media.mjs`](scripts/cleanup_orphaned_media.mjs):
 
-```sql
--- STEP 2: Safe cleanup of orphaned objects on Staging ONLY
--- Run inside an explicit transaction to verify affected count before committing
-BEGIN;
+```bash
+# Step 1: Run audit (Dry Run - no deletions performed)
+SUPABASE_URL=https://<staging-ref>.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
+node scripts/cleanup_orphaned_media.mjs
 
-DELETE FROM storage.objects
-WHERE bucket_id = 'media-library'
-  AND name NOT IN (
-      SELECT storage_path 
-      FROM public.media_assets
-  );
-
--- Verify the number of deleted rows matches expectations, then commit:
-COMMIT;
+# Step 2: Review candidate files, then execute safe deletion via Storage API
+SUPABASE_URL=https://<staging-ref>.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
+node scripts/cleanup_orphaned_media.mjs --delete
 ```
+
+#### Method B: Manual Supabase Storage API Deletion
+If performing deletion manually in a Node/TypeScript script or admin tool:
+```javascript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// 1. Identify candidate orphaned paths from SQL audit
+const orphanedPaths = ['uploads/unindexed_test_file.jpg'];
+
+// 2. Safely delete from BOTH storage backend and PostgreSQL in sync
+const { data, error } = await supabase.storage
+  .from('media-library')
+  .remove(orphanedPaths);
+
+if (error) console.error('Deletion error:', error);
+else console.log('Successfully removed:', data);
+```
+
+> [!WARNING]
+> Never execute mass deletion scripts on Production without a verified backup and confirmation that legacy static assets are not referenced.
 
 ---
 
@@ -184,76 +207,90 @@ Serve the root directory with any HTTP server (e.g. `npx serve`, Live Server, or
 
 ---
 
-## 🧪 Comprehensive Test Suite (67 Tests)
+## 🧪 Automated Test Suite (67 Tests) & Test Classifications
 
 ```bash
-# Run all tests
+# Run all automated tests
 node --test tests/*.test.mjs
 ```
 
-### Test Suites Breakdown:
-1. **`tests/integration_edge_function_upload.test.mjs` (11 tests)**:
-   - **MFA Consistency & Parity**:
-     - Rejection: Invalid or expired session rejected with 401.
-     - Rejection: AAL1 session rejected with 403 (MFA challenge required).
-     - Rejection: AAL2 session without verified TOTP factor rejected with 403.
-     - Rejection: Non-admin user rejected with 403 even if AAL2 and TOTP are present.
-     - Acceptance: AAL2 with verified TOTP factor and super_admin profile accepted (201).
-   - **Storage & RPC Bypass Closure**:
-     - Direct authenticated Storage INSERT rejection via PostgreSQL RLS.
-     - Direct RPC invocation rejection (`validate_and_register_media_asset` dropped).
-     - Forged JPEG header rejection (SOI followed by non-SOF or corrupt payload).
-     - Executable upload rejection (`MZ` header disguised as image).
-     - Unregistered object hiding via SELECT RLS policy.
-     - Failed database registration rollback (immediate storage object deletion).
+### Complete Test Classification Breakdown:
 
-2. **`tests/integration_draft_persistence_and_locking.test.mjs` (6 tests)**:
-   - Concurrency: Unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`).
-   - Section additions and deletions synchronization.
-   - Reordering RPC validation (monotonic 10-step renumbering).
-   - Publishing snapshot captures full draft state including hidden sections.
-   - Publishing completely aborts if draft persistence fails.
-   - `save_draft_page_transaction` atomic rollback: prevents partial persistence on failure.
+> [!NOTE]
+> **Technical Honesty & Test Categorization**:
+> Local tests run in a Node.js test environment without a live local PostgreSQL daemon. To avoid false confidence, tests are strictly classified into:
+> - **Category 1: Static SQL AST & Migration Contract Tests (13 tests)**
+> - **Category 2: Pure Unit & Binary Parser Tests (20 tests)**
+> - **Category 3: Simulated Interface & State Contract Tests (34 tests)**
+> - **Category 4: Live Staging Integration Test Suite (`scripts/verify_staging_integration.mjs`)**
 
-3. **`tests/integration_auth_and_mfa.test.mjs` (7 tests)**:
-   - Rejects invalid credentials.
-   - Authenticates valid user at AAL1 and identifies required MFA factors.
-   - Rejects invalid TOTP codes.
-   - Upgrades session to AAL2 upon successful challenge.
-   - Enforces `super_admin` role validation against `admin_profiles`.
-   - Rejects unauthorized users.
-   - Verifies session cleanup on logout.
+#### Category 1: Static SQL AST & Migration Contract Tests (13 tests)
+*File: `tests/migration_security.test.mjs`*
+- Validates SQL migration AST, default privilege hardening (`REVOKE EXECUTE ... FROM PUBLIC, anon`).
+- Verifies database-level single-admin singleton constraint (`uq_admin_profiles_singleton`).
+- Verifies direct draft mutation triggers for unified advisory locking (`pg_advisory_xact_lock`).
+- Verifies `is_admin_aal2` strict fail-closed check on `auth.mfa_factors` with **zero regex or AMR fallback**.
+- Verifies all sensitive RPCs acquire `mg_home_cms_workspace_lock`.
+- Verifies explicit `REVOKE`/`GRANT` matrix for all 9 functions/RPCs.
+- Verifies permanent dropping of untrusted `validate_and_register_media_asset` RPC.
+- Verifies complete removal of direct Storage write policies (`INSERT`/`UPDATE`/`DELETE`).
+- Verifies removal of automatic signup promotion triggers.
+- Verifies `provision_initial_admin` execution is restricted strictly to `service_role`.
+- Verifies strict non-empty snapshot schema checks on `page_revisions`.
 
-4. **`tests/migration_security.test.mjs` (13 tests)**:
-   - Validates SQL migration AST, default privilege hardening, RLS enforcement, single-admin constraints, unified locks, dropping auto-promotion triggers, `provision_initial_admin` privileges, dropping untrusted media RPC, eliminating direct storage write policies, and transactional draft RPC advisory locking.
+#### Category 2: Pure Unit & Binary Parser Tests (20 tests)
+*Files: `tests/media_validation.test.mjs`, `tests/preview_protocol.test.mjs`, `tests/public_fallback_and_renderers.test.mjs`, `tests/reorder_validation.test.mjs`*
+- **Binary Signature & Dimensions (7 tests)**: Magic bytes (`FF D8 FF`, `89 50 4E 47`, `RIFF...WEBP`), header chunk dimension extraction (SOF0/SOF2, IHDR, VP8), rejection of MIME spoofing (MZ executable disguised as JPEG) and oversized files (> 5MB).
+- **Preview Protocol & Handshake (5 tests)**: Sandboxed iframe preview handshake (`READY` -> `ACK` -> `INIT`), message origin validation, source window validation, section selection dispatching.
+- **Public Fallback & Renderers (5 tests)**: Preservation of GTM (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`), fallback HTML structure, and DOM generation for all 9 supported section types.
+- **Section Reordering Logic (5 tests)**: Reorder array validation (no nulls, no duplicates, no unknown IDs, no omitted IDs, monotonic 10-step permutation generation).
 
-5. **`tests/media_validation.test.mjs` (7 tests)**:
-   - Binary magic signature verification, MIME mismatch detection, file size limits, dimension limits.
-
-6. **`tests/preview_protocol.test.mjs` (5 tests)**:
-   - Sandboxed iframe preview handshake, source and origin security validation, message schema validation.
-
-7. **`tests/public_fallback_and_renderers.test.mjs` (5 tests)**:
-   - Verifies preservation of Google Tag Manager (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`).
-   - Verifies all 9 section renderers generate valid DOM strings with tracking attributes.
-
-8. **`tests/reorder_validation.test.mjs` (5 tests)**:
-   - Reorder input validation (no duplicates, no unknowns, no omissions, sequential 10-step permutation).
-
-9. **`tests/snapshot_integrity.test.mjs` (8 tests)**:
-   - Publishing validation (zero sections, all hidden, missing required fields).
-   - Restoration resiliency against missing, null, or malformed fields.
+#### Category 3: Simulated Interface & State Contract Tests (34 tests)
+*Files: `tests/integration_edge_function_upload.test.mjs` (11 tests), `tests/integration_draft_persistence_and_locking.test.mjs` (6 tests), `tests/integration_auth_and_mfa.test.mjs` (7 tests), `tests/snapshot_integrity.test.mjs` (8 tests), plus subtests*
+- **MFA Consistency & Parity (5 tests)**: Rejection of invalid/expired session (401), rejection of AAL1 session (403), rejection of AAL2 session lacking verified TOTP factor (403), rejection of non-admin user (403), acceptance of AAL2 with verified TOTP factor and `super_admin` profile (201).
+- **Storage & RPC Bypass Closure (6 tests)**: Rejection of direct client Storage INSERT via RLS, rejection of dropped `validate_and_register_media_asset` RPC, rejection of forged JPEG SOI headers, rejection of disguised executables, hiding of unindexed objects via SELECT RLS, rollback of storage object on simulated DB insert failure.
+- **Draft Persistence & Locking Contract (6 tests)**: Concurrency lock serialization, section additions and deletions sync, reordering RPC sequential ordering, full draft snapshot capture (including hidden sections), abort on persistence failure, atomic draft save contract.
+- **Supabase Auth & Session Lifecycle (7 tests)**: Invalid credential rejection, AAL1 authentication & MFA factor detection, invalid TOTP code rejection, session upgrade to AAL2, `super_admin` role validation, non-admin rejection, session clearance on logout.
+- **Snapshot Publishing & Restoration Resiliency (8 tests)**: Publishing validation (zero sections, all hidden, missing phone, missing Arabic title), restoration resiliency against null, missing, or malformed fields.
 
 ---
 
-## 📋 Explicit Staging-Only Verification Requirements
+## 📋 Live Staging Verification Suite & Runbook
 
-> [!IMPORTANT]
-> The automated test suite validates syntax, contracts, and simulated transactional semantics. **True security approval cannot be granted based on mocked or static tests alone.** The following live tests MUST be performed on a live Supabase Staging project before production cutover:
+For real end-to-end integration verification on a live Supabase Staging environment (verifying real PostgreSQL 15+ engine evaluation, real GoTrue cryptographic JWT signatures, and live Edge Function execution):
 
-1. **Clean Database Migration Execution**:
-   - Apply `supabase/migrations/20261119000001_initial_schema_v2_3_0.sql` on a fresh Supabase PostgreSQL 15+ instance.
-   - Confirm zero syntax errors, zero missing extensions, and proper RLS enablement across all 5 CMS tables and `storage.objects`.
+### 1. Automated Staging Verification Suite
+Execute the dedicated staging test runner at [`scripts/verify_staging_integration.mjs`](scripts/verify_staging_integration.mjs):
+
+```bash
+STAGING_SUPABASE_URL=https://<your-staging-project>.supabase.co \
+STAGING_SERVICE_ROLE_KEY=<your-service-role-secret> \
+STAGING_SUPABASE_ANON_KEY=<your-anon-key> \
+node scripts/verify_staging_integration.mjs
+```
+
+This live script automatically executes:
+1. Live PostgreSQL connection and schema verification.
+2. Direct client storage upload rejection via real PostgreSQL RLS.
+3. Verification that dropped RPC `validate_and_register_media_asset` does not exist on PostgreSQL (HTTP 404).
+4. Real PostgreSQL ACID transaction rollback during `save_draft_page_transaction` when provided malformed section data.
+5. Real PostgreSQL section reordering monotonic constraint enforcement.
+6. Strict fail-closed `is_admin_aal2()` check (confirming unauthenticated users return `false`).
+
+### 2. Manual Staging Verification Checklist
+Before production cutover, perform these physical verification steps on Staging:
+
+1. **Database Migration Execution**:
+   - Apply [`supabase/migrations/20261119000001_initial_schema_v2_3_0.sql`](supabase/migrations/20261119000001_initial_schema_v2_3_0.sql) on a clean Supabase Staging PostgreSQL instance. Confirm zero errors.
+2. **Initial Admin Provisioning**:
+   - Create a user in Supabase Auth Dashboard, then run `SELECT public.provision_initial_admin('<UID>'::uuid, 'Radwan Eldaly');` using the SQL Editor.
+3. **Physical TOTP MFA Enrollment**:
+   - Log in to Admin Studio, scan the QR code using Google Authenticator on a physical mobile device, enter the 6-digit TOTP code, and verify session upgrade to AAL2.
+4. **Deploy Edge Function**:
+   - Run `supabase functions deploy validate-image` and set `SUPABASE_SERVICE_ROLE_KEY`.
+   - Upload a test photo through Admin Studio and verify HTTP 201 response and object creation in storage.
+5. **Orphaned Storage Audit & Cleanup**:
+   - Run `node scripts/cleanup_orphaned_media.mjs` against Staging to ensure zero orphaned files exist.
 
 2. **Direct Storage Upload Bypass Attempt (CLI Verification)**:
    - Obtain an authenticated session JWT (with AAL2) for the admin.

@@ -334,21 +334,16 @@ BEGIN
         RETURN false;
     END IF;
 
-    -- 3. Check enrolled & verified TOTP factor
-    IF to_regclass('auth.mfa_factors') IS NOT NULL THEN
-        SELECT EXISTS (
-            SELECT 1 
-            FROM auth.mfa_factors 
-            WHERE user_id = auth.uid() 
-              AND factor_type = 'totp' 
-              AND status = 'verified'
-        ) INTO v_has_totp;
-    ELSE
-        -- Fallback to JWT AMR check if auth schema table is mocked or in transition
-        v_has_totp := (auth.jwt() -> 'amr' @> '[{"method": "totp"}]'::jsonb OR auth.jwt()::text ~ '"totp"');
-    END IF;
+    -- 3. Check enrolled & verified TOTP factor strictly in auth.mfa_factors (fail-closed, no fallback)
+    SELECT EXISTS (
+        SELECT 1 
+        FROM auth.mfa_factors 
+        WHERE user_id = auth.uid() 
+          AND factor_type = 'totp' 
+          AND status = 'verified'
+    ) INTO v_has_totp;
 
-    RETURN v_has_aal2 AND v_has_totp;
+    RETURN v_has_totp;
 END;
 $$;
 

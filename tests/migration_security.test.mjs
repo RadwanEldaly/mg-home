@@ -83,7 +83,7 @@ describe('1. Database Migration & Security Hardening Tests', () => {
     );
   });
 
-  it('is_admin_aal2 must verify super_admin role, JWT aal2, AND verified TOTP factor', () => {
+  it('is_admin_aal2 must verify super_admin role, JWT aal2, AND verified TOTP factor (fail-closed, no fallback)', () => {
     assert.match(
       sql,
       /CREATE OR REPLACE FUNCTION public\.is_admin_aal2\(\)/i,
@@ -103,6 +103,17 @@ describe('1. Database Migration & Security Hardening Tests', () => {
       sql,
       /factor_type\s*=\s*'totp'\s+AND\s+status\s*=\s*'verified'/i,
       'Must check verified TOTP factor in auth.mfa_factors'
+    );
+    // Explicitly verify NO fallback to regex or amr claims exists
+    assert.doesNotMatch(
+      sql,
+      /auth\.jwt\(\)\s*->\s*'amr'/i,
+      'is_admin_aal2 must NOT contain soft fallback to amr claim'
+    );
+    assert.doesNotMatch(
+      sql,
+      /auth\.jwt\(\)::text\s*~/i,
+      'is_admin_aal2 must NOT contain regex text matching fallback on JWT'
     );
   });
 
