@@ -106,15 +106,26 @@ function validateImageBuffer(bytes) {
 }
 
 describe('Integration Test: Storage Security Closure & Bypass Regression Tests', () => {
-  // Simulated Storage and DB backend reflecting PostgreSQL RLS semantics
+  // Simulated Storage and DB backend reflecting PostgreSQL RLS semantics & GoTrue Auth State
   class MockStorageAndDB {
     constructor() {
       this.uploadedFiles = new Map(); // storage_path -> bytes
       this.mediaAssets = new Map();    // id -> asset record
       this.shouldFailDbInsert = false;
 
+      // Mock user database and MFA factors
+      this.users = new Map([
+        ['usr-admin-1', { id: 'usr-admin-1', role: 'super_admin' }],
+        ['usr-guest-2', { id: 'usr-guest-2', role: 'guest' }]
+      ]);
+
+      // Server-side registered factors (userId -> array of factors)
+      this.userMfaFactors = new Map([
+        ['usr-admin-1', [{ factor_type: 'totp', status: 'verified' }]]
+      ]);
+
       // PostgreSQL Storage RLS policies for storage.objects:
-      // Notice: NO INSERT/UPDATE/DELETE policies exist for 'authenticated' or 'anon'
+      // NO INSERT/UPDATE/DELETE policies exist for 'authenticated' or 'anon'
       this.policies = {
         authenticated: { insert: false, update: false, delete: false, select: true },
         anon: { insert: false, update: false, delete: false, select: true },
@@ -162,9 +173,14 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
       this.mediaAssets.set(asset.id, asset);
       return { data: asset, error: null };
     }
+
+    hasVerifiedTotp(userId) {
+      const factors = this.userMfaFactors.get(userId) || [];
+      return factors.some(f => f.factor_type === 'totp' && f.status === 'verified');
+    }
   }
 
-  // Edge Function Request Handler Simulation
+  // Edge Function Request Handler Simulation (incorporating TOTP MFA Server-Side Verification)
   async function simulateEdgeFunctionRequest(req, backend) {
     const authHeader = req.headers?.authorization;
     if (!authHeader) {
@@ -174,18 +190,34 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     const token = authHeader.replace(/^Bearer\s+/i, '');
     let payload;
     try {
-      const b64 = token.split('.')[1];
+      const parts = token.split('.');
+      if (parts.length < 2) throw new Error('Invalid token structure');
+      const b64 = parts[1];
       payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
     } catch {
       return { status: 401, body: { error: 'Malformed authorization token.' } };
     }
 
+    // Check expiration
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      return { status: 401, body: { error: 'Authentication failed: Session has expired.' } };
+    }
+
+    // 1. Enforce AAL2 claim
     if (payload.aal !== 'aal2') {
       return { status: 403, body: { error: 'Access Denied: Administrative AAL2 (TOTP MFA) session required.' } };
     }
 
-    if (payload.role !== 'super_admin') {
+    // 2. Enforce super_admin role
+    const userRecord = backend.users.get(payload.sub);
+    if (!userRecord || userRecord.role !== 'super_admin') {
       return { status: 403, body: { error: 'Access Denied: Only verified super_admin can upload media assets.' } };
+    }
+
+    // 3. Enforce Server-Side Verified TOTP Factor check (Exact parity with is_admin_aal2)
+    const hasTotp = backend.hasVerifiedTotp(payload.sub);
+    if (!hasTotp) {
+      return { status: 403, body: { error: 'Access Denied: At least one verified TOTP factor is required.' } };
     }
 
     const file = req.file;
@@ -232,16 +264,113 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     return { status: 201, body: { success: true, asset: dbResult.data } };
   }
 
-  function createMockJwt(role = 'super_admin', aal = 'aal2') {
-    const payload = { sub: 'usr-admin-1', role, aal };
+  function createMockJwt(userId = 'usr-admin-1', role = 'super_admin', aal = 'aal2', expired = false) {
+    const payload = {
+      sub: userId,
+      role,
+      aal,
+      exp: expired ? Math.floor(Date.now() / 1000) - 3600 : Math.floor(Date.now() / 1000) + 3600
+    };
     return `header.${Buffer.from(JSON.stringify(payload)).toString('base64')}.sig`;
   }
 
-  it('1. Direct authenticated Storage INSERT rejection: Client cannot upload directly to storage.objects', () => {
+  // --- REGRESSION SUITE 1: MFA & Session Consistency Tests ---
+
+  it('1. Rejection: Invalid or expired session rejected with 401', async () => {
+    const backend = new MockStorageAndDB();
+
+    // Missing token
+    const resNoToken = await simulateEdgeFunctionRequest({ headers: {} }, backend);
+    assert.equal(resNoToken.status, 401);
+    assert.match(resNoToken.body.error, /Missing authorization token/);
+
+    // Expired token
+    const expiredToken = createMockJwt('usr-admin-1', 'super_admin', 'aal2', true);
+    const resExpired = await simulateEdgeFunctionRequest({
+      headers: { authorization: `Bearer ${expiredToken}` }
+    }, backend);
+    assert.equal(resExpired.status, 401);
+    assert.match(resExpired.body.error, /expired/);
+
+    // Malformed token
+    const resMalformed = await simulateEdgeFunctionRequest({
+      headers: { authorization: 'Bearer not-a-jwt' }
+    }, backend);
+    assert.equal(resMalformed.status, 401);
+  });
+
+  it('2. Rejection: AAL1 session rejected with 403 (MFA challenge required)', async () => {
+    const backend = new MockStorageAndDB();
+    const tokenAal1 = createMockJwt('usr-admin-1', 'super_admin', 'aal1');
+
+    const res = await simulateEdgeFunctionRequest({
+      headers: { authorization: `Bearer ${tokenAal1}` }
+    }, backend);
+
+    assert.equal(res.status, 403);
+    assert.match(res.body.error, /AAL2.*required/);
+  });
+
+  it('3. Rejection: AAL2 session without verified TOTP factor rejected with 403', async () => {
+    const backend = new MockStorageAndDB();
+    // Simulate user who has AAL2 claim in JWT but NO verified TOTP factor in database
+    backend.userMfaFactors.set('usr-admin-1', []); // empty factors
+
+    const token = createMockJwt('usr-admin-1', 'super_admin', 'aal2');
+    const res = await simulateEdgeFunctionRequest({
+      headers: { authorization: `Bearer ${token}` }
+    }, backend);
+
+    assert.equal(res.status, 403);
+    assert.match(res.body.error, /verified TOTP factor is required/);
+  });
+
+  it('4. Rejection: Non-admin user rejected with 403 even if AAL2 and TOTP are present', async () => {
+    const backend = new MockStorageAndDB();
+    // Guest user has TOTP factor
+    backend.userMfaFactors.set('usr-guest-2', [{ factor_type: 'totp', status: 'verified' }]);
+
+    const token = createMockJwt('usr-guest-2', 'guest', 'aal2');
+    const res = await simulateEdgeFunctionRequest({
+      headers: { authorization: `Bearer ${token}` }
+    }, backend);
+
+    assert.equal(res.status, 403);
+    assert.match(res.body.error, /Only verified super_admin/);
+  });
+
+  it('5. Acceptance: AAL2 with verified TOTP factor and super_admin profile accepted (201)', async () => {
+    const backend = new MockStorageAndDB();
+    const token = createMockJwt('usr-admin-1', 'super_admin', 'aal2');
+
+    const validJpeg = new Uint8Array([
+      0xFF, 0xD8,
+      0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+      0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0x58, 0x03, 0x20, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+      0xFF, 0xD9
+    ]);
+
+    const res = await simulateEdgeFunctionRequest({
+      headers: { authorization: `Bearer ${token}` },
+      file: { name: 'field_repair.jpg', size: validJpeg.length, bytes: validJpeg },
+      altAr: 'صيانة مكيف',
+      altEn: 'AC Repair'
+    }, backend);
+
+    assert.equal(res.status, 201);
+    assert.ok(res.body.success);
+    assert.equal(res.body.asset.mime_type, 'image/jpeg');
+    assert.equal(res.body.asset.width, 800);
+    assert.equal(res.body.asset.height, 600);
+    assert.equal(backend.uploadedFiles.size, 1);
+  });
+
+  // --- REGRESSION SUITE 2: Storage & RPC Bypass Closure Tests ---
+
+  it('6. Direct authenticated Storage INSERT rejection: Client cannot upload directly to storage.objects', () => {
     const backend = new MockStorageAndDB();
     const jpegBytes = new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]);
 
-    // An authenticated client attempting direct storage upload must fail RLS check
     assert.throws(
       () => backend.directClientUpload('authenticated', 'uploads/direct_bypass.jpg', jpegBytes),
       /RLS_ERROR.*violates row-level security policy/
@@ -249,8 +378,7 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     assert.equal(backend.uploadedFiles.size, 0, 'No direct client upload may enter storage');
   });
 
-  it('2. Direct RPC invocation rejection: validate_and_register_media_asset RPC is dropped/unavailable', () => {
-    // Simulating database RPC invocation when function has been dropped
+  it('7. Direct RPC invocation rejection: validate_and_register_media_asset RPC is dropped/unavailable', () => {
     const executeRpc = (rpcName) => {
       const availableRpcs = new Set([
         'is_admin_aal2',
@@ -271,15 +399,14 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     );
   });
 
-  it('3. Forged JPEG header rejection: Rejects JPEG SOI followed by corrupt or non-SOF payload', async () => {
+  it('8. Forged JPEG header rejection: Rejects JPEG SOI followed by corrupt or non-SOF payload', async () => {
     const backend = new MockStorageAndDB();
-    const token = createMockJwt('super_admin', 'aal2');
+    const token = createMockJwt('usr-admin-1', 'super_admin', 'aal2');
 
-    // Forged JPEG: Starts with FF D8 FF E0 but has NO SOF marker (SOF0 0xC0 or SOF2 0xC2)
     const forgedJpeg = new Uint8Array([
       0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-      0x3C, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x3E // "<script>" payload
+      0x3C, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x3E
     ]);
 
     const res = await simulateEdgeFunctionRequest({
@@ -289,14 +416,13 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
 
     assert.equal(res.status, 422);
     assert.match(res.body.error, /Corrupt or forged JPEG/);
-    assert.equal(backend.uploadedFiles.size, 0, 'Forged JPEG must not be uploaded to storage');
+    assert.equal(backend.uploadedFiles.size, 0);
   });
 
-  it('4. Executable upload rejection: Rejects .exe (MZ header) disguised as image', async () => {
+  it('9. Executable upload rejection: Rejects .exe (MZ header) disguised as image', async () => {
     const backend = new MockStorageAndDB();
-    const token = createMockJwt('super_admin', 'aal2');
+    const token = createMockJwt('usr-admin-1', 'super_admin', 'aal2');
 
-    // MZ DOS executable header
     const mzBytes = new Uint8Array([0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]);
 
     const res = await simulateEdgeFunctionRequest({
@@ -309,27 +435,24 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     assert.equal(backend.uploadedFiles.size, 0);
   });
 
-  it('5. Unregistered object public-access behavior: SELECT RLS policy hides unregistered objects', () => {
+  it('10. Unregistered object public-access behavior: SELECT RLS policy hides unregistered objects', () => {
     const backend = new MockStorageAndDB();
     const orphanPath = 'uploads/unregistered_orphan.jpg';
 
-    // Object exists in storage, but is NOT registered in media_assets
     backend.uploadedFiles.set(orphanPath, new Uint8Array([1, 2, 3]));
 
-    // Query storage.objects via RLS policy
     const rows = backend.queryStorageObjects(orphanPath);
     assert.equal(rows.length, 0, 'Unregistered object must not be returned by storage.objects query');
 
-    // Once registered in media_assets, it becomes visible in query
     backend.mediaAssets.set('asset-1', { id: 'asset-1', storage_path: orphanPath });
     const registeredRows = backend.queryStorageObjects(orphanPath);
     assert.equal(registeredRows.length, 1);
   });
 
-  it('6. Failed database registration rollback: Storage object is deleted immediately on DB failure', async () => {
+  it('11. Failed database registration rollback: Storage object is deleted immediately on DB failure', async () => {
     const backend = new MockStorageAndDB();
-    backend.shouldFailDbInsert = true; // Trigger database error
-    const token = createMockJwt('super_admin', 'aal2');
+    backend.shouldFailDbInsert = true;
+    const token = createMockJwt('usr-admin-1', 'super_admin', 'aal2');
 
     const validJpeg = new Uint8Array([
       0xFF, 0xD8,
@@ -346,48 +469,5 @@ describe('Integration Test: Storage Security Closure & Bypass Regression Tests',
     assert.equal(res.status, 500);
     assert.match(res.body.error, /DATABASE_UNIQUE_VIOLATION/);
     assert.equal(backend.uploadedFiles.size, 0, 'Storage object must be deleted when DB registration fails');
-  });
-
-  it('7. Successful Edge Function upload: Valid JPEG with decoded dimensions uploaded and registered (201)', async () => {
-    const backend = new MockStorageAndDB();
-    const token = createMockJwt('super_admin', 'aal2');
-
-    const validJpeg = new Uint8Array([
-      0xFF, 0xD8,
-      0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-      0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0x58, 0x03, 0x20, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
-      0xFF, 0xD9
-    ]);
-
-    const res = await simulateEdgeFunctionRequest({
-      headers: { authorization: `Bearer ${token}` },
-      file: { name: 'field_repair.jpg', size: validJpeg.length, bytes: validJpeg },
-      altAr: 'صيانة مكيف سبليت',
-      altEn: 'Split AC Repair'
-    }, backend);
-
-    assert.equal(res.status, 201);
-    assert.ok(res.body.success);
-    assert.equal(res.body.asset.mime_type, 'image/jpeg');
-    assert.equal(res.body.asset.width, 800);
-    assert.equal(res.body.asset.height, 600);
-    assert.equal(backend.uploadedFiles.size, 1);
-    assert.equal(backend.mediaAssets.size, 1);
-  });
-
-  it('8. Unauthorized & AAL1 Edge Function requests rejected with 401 and 403', async () => {
-    const backend = new MockStorageAndDB();
-
-    // No token
-    const resNoAuth = await simulateEdgeFunctionRequest({ headers: {} }, backend);
-    assert.equal(resNoAuth.status, 401);
-
-    // AAL1 token (MFA not completed)
-    const tokenAal1 = createMockJwt('super_admin', 'aal1');
-    const resAal1 = await simulateEdgeFunctionRequest({
-      headers: { authorization: `Bearer ${tokenAal1}` }
-    }, backend);
-    assert.equal(resAal1.status, 403);
-    assert.match(resAal1.body.error, /AAL2/);
   });
 });

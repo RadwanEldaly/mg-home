@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.4 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.5 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.4).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.5: MFA Consistency & Public Storage Audit).
 
 ---
 
@@ -38,14 +38,18 @@ The system strictly adheres to the approved single-page, single-admin architectu
      - Single-admin database constraint enforced at schema and trigger level (`uq_admin_profiles_singleton`).
      - Untrusted `validate_and_register_media_asset` RPC permanently dropped.
 
-4. **Storage Security Closure & Complete Write Isolation**:
+4. **Storage Security Closure, MFA Parity & Complete Write Isolation**:
    - Direct-to-storage client uploads and mutations have been completely eliminated:
      - All `INSERT`, `UPDATE`, and `DELETE` policies on `storage.objects` for `authenticated` and `anon` roles have been removed.
      - Direct client upload bypasses fail with PostgreSQL RLS violation.
    - The bucket `media-library` is configured for high-speed public CDN delivery of static assets.
    - **Write Isolation Guarantee**: The ONLY path that can write to `media-library` is the trusted Edge Function (`validate-image`) using `service_role`.
+   - **MFA Consistency & Parity**: The Edge Function enforces identical authorization guarantees to `public.is_admin_aal2()`:
+     - Valid Supabase user session (`auth.getUser()`).
+     - Administrative assurance level `aal2` in session JWT claims.
+     - Verified `super_admin` role in `admin_profiles` table.
+     - Server-side verified TOTP factor via Supabase GoTrue Admin MFA API (`supabaseAdmin.auth.admin.mfa.listFactors({ userId })`), requiring at least one enrolled factor where `factor_type = 'totp'` and `status = 'verified'`. Client-provided claims are never trusted blindly.
    - The Edge Function validates:
-     - Super admin role and verified AAL2 (TOTP MFA) session.
      - Binary magic bytes in server memory (`FF D8 FF` for JPEG, `89 50 4E 47` for PNG, `RIFF...WEBP` for WebP).
      - Decodes true image dimensions from chunk headers (SOF0/SOF2, IHDR, VP8/VP8L/VP8X).
      - Rejects forged headers, oversized files (> 5MB), and corrupt payloads *before* writing to storage.
@@ -87,6 +91,66 @@ SELECT public.provision_initial_admin(
 
 ---
 
+## 🔍 Public Storage Security Audit & Staging Cleanup Procedure
+
+### 1. Analysis of Supabase Public Storage & CDN Architecture
+In Supabase Storage, the `media-library` bucket is configured with `public = true` to serve static website assets (hero banners, service icons, gallery images) with optimal cacheability and latency.
+
+- **Public CDN URL Behavior**: Direct requests to `https://<project-ref>.supabase.co/storage/v1/object/public/media-library/<path>` are served directly by the Supabase Storage CDN/API gateway. These public GET requests **bypass PostgreSQL Row Level Security (RLS)** completely.
+- **Role of SELECT RLS Policy**: The `media_library_public_read` SELECT policy on `storage.objects` strictly controls PostgREST database queries (e.g. `supabase.storage.from('media-library').list()`). It filters catalog listings so that only objects registered in `public.media_assets` are returned. However, if an attacker knows or discovers a direct public path of an unindexed object, CDN access is permitted by design of public buckets.
+- **Write Isolation is the Sole Security Boundary**: Because CDN reads cannot be restricted by RLS on public buckets, security is achieved via **absolute write isolation**:
+  1. ALL direct `INSERT`, `UPDATE`, and `DELETE` policies for `anon` and `authenticated` roles are DROPPED.
+  2. No client can upload, overwrite, or delete objects directly.
+  3. The ONLY authorized writer is the trusted Edge Function (`validate-image`), which executes with `service_role`.
+  4. The Edge Function inspects file magic bytes and validates image headers in server memory before any bytes reach storage.
+  5. If database catalog insertion fails, the Edge Function deletes the object immediately, ensuring zero orphaned objects are created going forward.
+
+### 2. Staging Existing-Object Risk & Audit
+During early development iterations (prior to Phase 03.4 write isolation), manual testing or direct client uploads may have placed unverified or orphaned objects inside the `media-library` bucket. These objects remain accessible if their URL is discovered.
+
+To identify and audit all orphaned objects on your Supabase Staging project, execute the following SQL in the Supabase **SQL Editor**:
+
+```sql
+-- STEP 1: Audit query to discover orphaned objects in staging media-library
+SELECT 
+    id, 
+    name, 
+    bucket_id, 
+    created_at, 
+    (metadata->>'size')::bigint AS size_bytes,
+    (metadata->>'mimetype') AS mime_type
+FROM storage.objects
+WHERE bucket_id = 'media-library'
+  AND name NOT IN (
+      SELECT storage_path 
+      FROM public.media_assets
+  );
+```
+
+### 3. Safe Staging Cleanup Procedure (Staging Only)
+> [!CAUTION]
+> **STAGING ENVIRONMENT ONLY**: Never execute mass deletion scripts on production without first verifying if existing legacy pages reference static paths!
+
+To clean up all untrusted, unindexed, or test files on Staging:
+
+```sql
+-- STEP 2: Safe cleanup of orphaned objects on Staging ONLY
+-- Run inside an explicit transaction to verify affected count before committing
+BEGIN;
+
+DELETE FROM storage.objects
+WHERE bucket_id = 'media-library'
+  AND name NOT IN (
+      SELECT storage_path 
+      FROM public.media_assets
+  );
+
+-- Verify the number of deleted rows matches expectations, then commit:
+COMMIT;
+```
+
+---
+
 ## 🚀 Getting Started
 
 ### 1. Database Setup (Supabase)
@@ -120,7 +184,7 @@ Serve the root directory with any HTTP server (e.g. `npx serve`, Live Server, or
 
 ---
 
-## 🧪 Comprehensive Test Suite (64 Tests)
+## 🧪 Comprehensive Test Suite (67 Tests)
 
 ```bash
 # Run all tests
@@ -128,15 +192,20 @@ node --test tests/*.test.mjs
 ```
 
 ### Test Suites Breakdown:
-1. **`tests/integration_storage_bypass_and_draft_transaction.test.mjs` (8 tests)**:
-   - Direct authenticated Storage INSERT rejection via PostgreSQL RLS.
-   - Direct RPC invocation rejection (`validate_and_register_media_asset` dropped).
-   - Forged JPEG header rejection (SOI followed by non-SOF or corrupt payload).
-   - Executable upload rejection (`MZ` header disguised as image).
-   - Unregistered object hiding via SELECT RLS policy.
-   - Failed database registration rollback (immediate storage object deletion).
-   - Successful Edge Function upload (JPEG, PNG, WebP with decoded dimensions).
-   - Unauthorized and AAL1 Edge Function request rejection.
+1. **`tests/integration_edge_function_upload.test.mjs` (11 tests)**:
+   - **MFA Consistency & Parity**:
+     - Rejection: Invalid or expired session rejected with 401.
+     - Rejection: AAL1 session rejected with 403 (MFA challenge required).
+     - Rejection: AAL2 session without verified TOTP factor rejected with 403.
+     - Rejection: Non-admin user rejected with 403 even if AAL2 and TOTP are present.
+     - Acceptance: AAL2 with verified TOTP factor and super_admin profile accepted (201).
+   - **Storage & RPC Bypass Closure**:
+     - Direct authenticated Storage INSERT rejection via PostgreSQL RLS.
+     - Direct RPC invocation rejection (`validate_and_register_media_asset` dropped).
+     - Forged JPEG header rejection (SOI followed by non-SOF or corrupt payload).
+     - Executable upload rejection (`MZ` header disguised as image).
+     - Unregistered object hiding via SELECT RLS policy.
+     - Failed database registration rollback (immediate storage object deletion).
 
 2. **`tests/integration_draft_persistence_and_locking.test.mjs` (6 tests)**:
    - Concurrency: Unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`).

@@ -202,7 +202,33 @@ serve(async (req: Request) => {
       });
     }
 
-    // 5. Parse multipart form data
+    // 5. Server-Side Verification of Active TOTP MFA Factor
+    // Exact parity with public.is_admin_aal2(): user must possess an enrolled and verified TOTP factor
+    const { data: factorsData, error: factorsError } = await supabaseAdmin.auth.admin.mfa.listFactors({
+      userId: user.id
+    });
+
+    if (factorsError) {
+      return new Response(JSON.stringify({ error: `MFA Factor verification failed: ${factorsError.message}` }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    const hasVerifiedTotp = Boolean(
+      factorsData?.factors?.some(
+        (f: { factor_type: string; status: string }) => f.factor_type === "totp" && f.status === "verified"
+      )
+    );
+
+    if (!hasVerifiedTotp) {
+      return new Response(JSON.stringify({ error: "Access Denied: At least one verified TOTP factor is required." }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    // 6. Parse multipart form data
     const contentType = req.headers.get("content-type") || "";
     if (!contentType.includes("multipart/form-data")) {
       return new Response(JSON.stringify({ error: "Content-Type must be multipart/form-data." }), {
