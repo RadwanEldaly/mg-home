@@ -44,6 +44,39 @@ CREATE TRIGGER trg_enforce_single_admin
     BEFORE INSERT ON public.admin_profiles
     FOR EACH ROW EXECUTE FUNCTION public.fn_enforce_single_admin();
 
+-- Step 3.1: Official Supabase Auth Bootstrap Trigger for Initial Admin Profile
+-- Seamlessly provisions the admin_profiles record when the super admin signs up
+CREATE OR REPLACE FUNCTION public.fn_handle_new_admin_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+    IF (SELECT COUNT(*) FROM public.admin_profiles) = 0 THEN
+        INSERT INTO public.admin_profiles (
+            id,
+            full_name,
+            email,
+            role,
+            is_singleton
+        ) VALUES (
+            NEW.id,
+            COALESCE(NEW.raw_user_meta_data->>'full_name', 'System Administrator'),
+            NEW.email,
+            'super_admin',
+            true
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_on_auth_user_created ON auth.users;
+CREATE TRIGGER trg_on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.fn_handle_new_admin_user();
+
 -- Step 4: Draft Site Settings (Singleton row: id = 1)
 CREATE TABLE IF NOT EXISTS public.draft_site_settings (
     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -911,6 +944,7 @@ $$;
 REVOKE ALL ON FUNCTION public.fn_set_updated_at() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.fn_prevent_singleton_deletion() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.fn_enforce_single_admin() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.fn_handle_new_admin_user() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.fn_acquire_workspace_lock() FROM PUBLIC, anon, authenticated;
 
 REVOKE ALL ON FUNCTION public.is_admin_aal2() FROM PUBLIC, anon;
@@ -945,7 +979,13 @@ DROP POLICY IF EXISTS "media_library_public_read" ON storage.objects;
 CREATE POLICY "media_library_public_read"
 ON storage.objects FOR SELECT
 TO anon, authenticated
-USING (bucket_id = 'media-library');
+USING (
+    bucket_id = 'media-library'
+    AND EXISTS (
+        SELECT 1 FROM public.media_assets
+        WHERE storage_path = name
+    )
+);
 
 DROP POLICY IF EXISTS "media_library_admin_upload" ON storage.objects;
 CREATE POLICY "media_library_admin_upload"
