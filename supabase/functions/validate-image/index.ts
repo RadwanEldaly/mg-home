@@ -68,6 +68,10 @@ export function validateImageBuffer(bytes: Uint8Array): ValidationResponse {
       offset += 2 + length;
     }
 
+    if (width <= 0 || height <= 0) {
+      return { valid: false, error: "Corrupt or forged JPEG: No valid SOF frame marker found in JPEG stream." };
+    }
+
     if (width > 8192 || height > 8192) {
       return { valid: false, error: `Invalid JPEG dimensions (${width}x${height}). Exceeds 8192x8192.` };
     }
@@ -75,8 +79,8 @@ export function validateImageBuffer(bytes: Uint8Array): ValidationResponse {
     return { 
       valid: true, 
       mimeType: "image/jpeg", 
-      width: width || 1200, 
-      height: height || 800 
+      width, 
+      height 
     };
   }
 
@@ -85,10 +89,10 @@ export function validateImageBuffer(bytes: Uint8Array): ValidationResponse {
     bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
     bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
   ) {
-    let width = 1200;
-    let height = 800;
+    let width = 0;
+    let height = 0;
 
-    // Optional parse for WebP chunks
+    // Parse for WebP chunks
     if (bytes.length >= 30) {
       const fourCC = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
       if (fourCC === "VP8X" && bytes.length >= 30) {
@@ -105,6 +109,10 @@ export function validateImageBuffer(bytes: Uint8Array): ValidationResponse {
         width = 1 + (((b2 & 0x3f) << 8) | b1);
         height = 1 + (((b4 & 0x0f) << 10) | (b3 << 2) | ((b2 & 0xc0) >> 6));
       }
+    }
+
+    if (width <= 0 || height <= 0) {
+      return { valid: false, error: "Corrupt or forged WebP: Missing or invalid VP8/VP8L/VP8X chunk header." };
     }
 
     if (width > 8192 || height > 8192) {
@@ -194,7 +202,33 @@ serve(async (req: Request) => {
       });
     }
 
-    // 5. Parse multipart form data
+    // 5. Server-Side Verification of Active TOTP MFA Factor
+    // Exact parity with public.is_admin_aal2(): user must possess an enrolled and verified TOTP factor
+    const { data: factorsData, error: factorsError } = await supabaseAdmin.auth.admin.mfa.listFactors({
+      userId: user.id
+    });
+
+    if (factorsError) {
+      return new Response(JSON.stringify({ error: `MFA Factor verification failed: ${factorsError.message}` }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    const hasVerifiedTotp = Boolean(
+      factorsData?.factors?.some(
+        (f: { factor_type: string; status: string }) => f.factor_type === "totp" && f.status === "verified"
+      )
+    );
+
+    if (!hasVerifiedTotp) {
+      return new Response(JSON.stringify({ error: "Access Denied: At least one verified TOTP factor is required." }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    // 6. Parse multipart form data
     const contentType = req.headers.get("content-type") || "";
     if (!contentType.includes("multipart/form-data")) {
       return new Response(JSON.stringify({ error: "Content-Type must be multipart/form-data." }), {

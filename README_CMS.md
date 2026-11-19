@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.3 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.10 Implementation)
 
-This repository contains the engineering implementation and security remediation of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.3).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.10: Final Security Verification Corrections).
 
 ---
 
@@ -25,7 +25,7 @@ The system strictly adheres to the approved single-page, single-admin architectu
      - **Right Inspector**: Bilingual property inspector (Arabic RTL / English LTR), styling, padding, and content editing.
    - 30-step undo/redo state stack.
    - Single-admin authentication with mandatory TOTP MFA (AAL2) — zero hardcoded credentials or local storage authorization bypasses.
-   - Draft persistence with real-time PostgreSQL synchronization.
+   - Atomic draft persistence via transactional server-side RPC `save_draft_page_transaction`.
    - Atomic publishing and full rollback/restore support.
 
 3. **Backend & Database (`supabase/migrations/`)**:
@@ -33,21 +33,27 @@ The system strictly adheres to the approved single-page, single-admin architectu
    - Complete draft and published snapshot isolation:
      - Draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) are 100% private.
      - `page_revisions` stores immutable JSONB snapshots of published states.
-     - Hardened RPCs with unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`): `publish_page_revision`, `restore_revision_to_draft`, `reorder_draft_sections`.
+     - Hardened RPCs with unified workspace advisory lock (`hashtext('mg_home_cms_workspace_lock')`): `save_draft_page_transaction`, `publish_page_revision`, `restore_revision_to_draft`, `reorder_draft_sections`.
      - Explicit `GRANT`/`REVOKE` matrix preventing anonymous draft leakage.
      - Single-admin database constraint enforced at schema and trigger level (`uq_admin_profiles_singleton`).
-     - Storage bucket `media-library` with MIME and path restrictions.
+     - Untrusted `validate_and_register_media_asset` RPC permanently dropped.
+     - **Strict Fail-Closed Helper `public.is_admin_aal2()`**: Queries `auth.mfa_factors` directly for `factor_type = 'totp'` AND `status = 'verified'` with zero fallback to AMR array or regex matching on JWT strings.
 
-4. **Trusted Edge Function Media Validation (`supabase/functions/validate-image/`)**:
-   - Direct-to-storage client uploads have been eliminated.
-   - Client sends multipart uploads to the server-side Edge Function with active JWT.
+4. **Storage Security Closure, MFA Parity & Complete Write Isolation**:
+   - Direct-to-storage client uploads and mutations have been completely eliminated:
+     - All `INSERT`, `UPDATE`, and `DELETE` policies on `storage.objects` for `authenticated` and `anon` roles have been removed.
+     - Direct client upload bypasses fail with PostgreSQL RLS violation.
+   - The bucket `media-library` is configured for high-speed public CDN delivery of static assets.
+   - **Write Isolation Guarantee**: The ONLY path that can write to `media-library` is the trusted Edge Function (`validate-image`) using `service_role`.
+   - **MFA Consistency & Parity**: The Edge Function enforces identical authorization guarantees to `public.is_admin_aal2()`:
+     - Valid Supabase user session (`auth.getUser()`).
+     - Administrative assurance level `aal2` in session JWT claims.
+     - Verified `super_admin` role in `admin_profiles` table.
+     - Server-side verified TOTP factor via Supabase GoTrue Admin MFA API (`supabaseAdmin.auth.admin.mfa.listFactors({ userId })`), requiring at least one enrolled factor where `factor_type = 'totp'` and `status = 'verified'`. Client-provided claims are never trusted blindly.
    - The Edge Function validates:
-     - Valid user session with `super_admin` role in `admin_profiles`.
-     - Active AAL2 (TOTP MFA) session claim.
      - Binary magic bytes in server memory (`FF D8 FF` for JPEG, `89 50 4E 47` for PNG, `RIFF...WEBP` for WebP).
      - Decodes true image dimensions from chunk headers (SOF0/SOF2, IHDR, VP8/VP8L/VP8X).
-     - Rejects spoofed or malicious payloads *before* any byte touches storage.
-     - Uploads to storage using `service_role` and inserts approved record into `public.media_assets`.
+     - Rejects forged headers, oversized files (> 5MB), and corrupt payloads *before* writing to storage.
      - Automatically rolls back and deletes storage objects if database registration fails.
 
 ---
@@ -86,6 +92,98 @@ SELECT public.provision_initial_admin(
 
 ---
 
+## 🔍 Public Storage Security Audit & Staging Cleanup Procedure
+
+### 1. Analysis of Supabase Public Storage & CDN Architecture
+In Supabase Storage, the `media-library` bucket is configured with `public = true` to serve static website assets (hero banners, service icons, gallery images) with optimal cacheability and latency.
+
+- **Public CDN URL Behavior**: Direct requests to `https://<project-ref>.supabase.co/storage/v1/object/public/media-library/<path>` are served directly by the Supabase Storage CDN/API gateway. These public GET requests **bypass PostgreSQL Row Level Security (RLS)** completely.
+- **Role of SELECT RLS Policy**: The `media_library_public_read` SELECT policy on `storage.objects` strictly controls PostgREST database queries (e.g. `supabase.storage.from('media-library').list()`). It filters catalog listings so that only objects registered in `public.media_assets` are returned. However, if an attacker knows or discovers a direct public path of an unindexed object, CDN access is permitted by design of public buckets.
+- **Write Isolation is the Sole Security Boundary**: Because CDN reads cannot be restricted by RLS on public buckets, security is achieved via **absolute write isolation**:
+  1. ALL direct `INSERT`, `UPDATE`, and `DELETE` policies for `anon` and `authenticated` roles are DROPPED.
+  2. No client can upload, overwrite, or delete objects directly.
+  3. The ONLY authorized writer is the trusted Edge Function (`validate-image`), which executes with `service_role`.
+  4. The Edge Function inspects file magic bytes and validates image headers in server memory before any bytes reach storage.
+  5. If database catalog insertion fails, the Edge Function deletes the object immediately, ensuring zero orphaned objects are created going forward.
+
+### 2. Staging Existing-Object Risk & Audit
+During early development iterations (prior to Phase 03.4 write isolation), manual testing or direct client uploads may have placed unverified or orphaned objects inside the `media-library` bucket. These objects remain accessible if their URL is discovered.
+
+To identify and audit all orphaned objects on your Supabase Staging project, execute the following SQL in the Supabase **SQL Editor**:
+
+```sql
+-- STEP 1: Audit query to discover orphaned objects in staging media-library
+SELECT 
+    id, 
+    name, 
+    bucket_id, 
+    created_at, 
+    (metadata->>'size')::bigint AS size_bytes,
+    (metadata->>'mimetype') AS mime_type
+FROM storage.objects
+WHERE bucket_id = 'media-library'
+  AND name NOT IN (
+      SELECT storage_path 
+      FROM public.media_assets
+  );
+```
+
+### 3. Safe Staging Cleanup Procedure (Storage API)
+> [!CAUTION]
+> **WHY DIRECT SQL `DELETE FROM storage.objects` IS STRICTLY PROHIBITED**:
+> In Supabase Storage, deleting records directly from `storage.objects` via SQL removes only the PostgreSQL metadata row. It **does NOT delete the underlying physical binary files** from the storage backend (S3/GCS bucket). This causes physical files to become permanently stranded/orphaned on disk and desynchronizes Supabase Storage metadata.
+> 
+> Per official Supabase documentation, storage object deletion MUST be performed through the **Supabase Storage API** (`supabase.storage.from('media-library').remove([paths])`).
+
+#### Method A: Using the Hardened Staging Cleanup Tool
+A hardened, safe Node.js cleanup script is provided at [`scripts/cleanup_orphaned_media.mjs`](scripts/cleanup_orphaned_media.mjs) featuring:
+- **Mandatory Staging Allowlist**: `STAGING_PROJECT_ALLOWLIST` is strictly mandatory. Absolute rejection of Production and arbitrary project references with zero fuzzy fallback.
+- **Full Recursive Pagination**: Recursively traverses all nested folders in `media-library` with paginated retrieval.
+- **Deterministic Database Pagination**: Enforces `order=storage_path.asc` to guarantee zero skipped records.
+- **Recursive Codebase Static Asset Protection**: Recursively scans `index.html`, `js/`, `css/`, `Img/`, `assets/`, `Logo/` and protects both full paths and basenames. Fails closed if repository root cannot be verified.
+- **Strict Full-Metadata Report Comparison**: Requires `--report=<report.json>`. Validates `schema_version: '3.9'`, `project_ref`, `target_url`, and compares candidate paths, sizes, and MIME types. Aborts immediately if live storage changed.
+
+```bash
+# Step 1: Run audit & generate candidate report (Dry Run - zero deletions)
+SUPABASE_URL=https://<staging-ref>.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
+STAGING_PROJECT_ALLOWLIST=<staging-ref> \
+node scripts/cleanup_orphaned_media.mjs
+
+# Step 2: Inspect generated JSON report, then execute safe deletion via Storage API
+SUPABASE_URL=https://<staging-ref>.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
+STAGING_PROJECT_ALLOWLIST=<staging-ref> \
+node scripts/cleanup_orphaned_media.mjs \
+  --delete \
+  --confirm-staging-project=<staging-ref> \
+  --report=staging_orphaned_report_<staging-ref>_<timestamp>.json
+```
+
+#### Method B: Manual Supabase Storage API Deletion
+If performing deletion manually in a Node/TypeScript script or admin tool:
+```javascript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// 1. Identify candidate orphaned paths from SQL audit
+const orphanedPaths = ['uploads/unindexed_test_file.jpg'];
+
+// 2. Safely delete from BOTH storage backend and PostgreSQL in sync
+const { data, error } = await supabase.storage
+  .from('media-library')
+  .remove(orphanedPaths);
+
+if (error) console.error('Deletion error:', error);
+else console.log('Successfully removed:', data);
+```
+
+> [!WARNING]
+> Never execute mass deletion scripts on Production without a verified backup and confirmation that legacy static assets are not referenced.
+
+---
+
 ## 🚀 Getting Started
 
 ### 1. Database Setup (Supabase)
@@ -119,56 +217,115 @@ Serve the root directory with any HTTP server (e.g. `npx serve`, Live Server, or
 
 ---
 
-## 🧪 Comprehensive Test Suite (58 Tests)
-
-The test suite covers static contract analysis, pure unit tests, and integration simulations:
+## 🧪 Automated Test Suite (79 Tests across 10 Suites) & Test Classifications
 
 ```bash
-# Run all tests
+# Run all automated tests
 node --test tests/*.test.mjs
 ```
 
-### Test Suites Breakdown:
-1. **`tests/integration_auth_and_mfa.test.mjs` (7 tests)**:
-   - Rejects invalid credentials.
-   - Authenticates valid user at AAL1 and identifies required MFA factors.
-   - Rejects invalid TOTP codes.
-   - Upgrades session to AAL2 upon successful challenge.
-   - Enforces `super_admin` role validation against `admin_profiles`.
-   - Rejects unauthorized users.
-   - Verifies session cleanup on logout.
+### Complete Test Classification Breakdown:
 
-2. **`tests/integration_draft_persistence_and_locking.test.mjs` (5 tests)**:
-   - Verifies unified workspace advisory lock (`424242`) preventing concurrent conflicting mutations.
-   - Validates section addition and deletion synchronization in the database.
-   - Tests reordering RPC enforcing sequential order values and strict validation.
-   - Verifies that published snapshots preserve both visible and hidden sections.
-   - Confirms that publishing transaction completely aborts if draft persistence fails.
+> [!NOTE]
+> **Technical Honesty & Test Categorization**:
+> Local tests run in a Node.js test environment without a live local PostgreSQL daemon. To avoid false confidence, tests are strictly classified into:
+> - **Category 1: Static SQL AST & Migration Contract Tests (13 tests)**
+> - **Category 2: Pure Unit & Binary Parser Tests (20 tests)**
+> - **Category 3: Simulated Interface & State Contract Tests (34 tests)**
+> - **Category 4: Staging Safety Guards & Harness Unit Tests (12 tests)**
+> - **Category 5: Live Staging Integration Test Suite (`scripts/verify_staging_integration.mjs`)**
 
-3. **`tests/integration_edge_function_upload.test.mjs` (6 tests)**:
-   - Rejects unauthenticated upload requests with 401.
-   - Rejects AAL1 sessions with 403 (MFA required).
-   - Rejects non-admin users with 403.
-   - Rejects spoofed executables (`MZ` header) with 422 before storage write.
-   - Successfully uploads and registers valid JPEG, PNG, and WebP images with 201.
-   - Rolls back and deletes uploaded storage objects if database registration fails.
+#### Category 1: Static SQL AST & Migration Contract Tests (13 tests)
+*File: `tests/migration_security.test.mjs`*
+- Validates SQL migration AST, default privilege hardening (`REVOKE EXECUTE ... FROM PUBLIC, anon`).
+- Verifies database-level single-admin singleton constraint (`uq_admin_profiles_singleton`).
+- Verifies direct draft mutation triggers for unified advisory locking (`pg_advisory_xact_lock`).
+- Verifies `is_admin_aal2` strict fail-closed check on `auth.mfa_factors` with **zero regex or AMR fallback**.
+- Verifies all sensitive RPCs acquire `mg_home_cms_workspace_lock`.
+- Verifies explicit `REVOKE`/`GRANT` matrix for all 9 functions/RPCs.
+- Verifies permanent dropping of untrusted `validate_and_register_media_asset` RPC.
+- Verifies complete removal of direct Storage write policies (`INSERT`/`UPDATE`/`DELETE`).
+- Verifies removal of automatic signup promotion triggers.
+- Verifies `provision_initial_admin` execution is restricted strictly to `service_role`.
+- Verifies strict non-empty snapshot schema checks on `page_revisions`.
 
-4. **`tests/migration_security.test.mjs` (10 tests)**:
-   - Validates SQL migration AST, default privilege hardening, RLS enforcement, single-admin constraints, unified locks, dropping auto-promotion triggers, and `provision_initial_admin` privileges.
+#### Category 2: Pure Unit & Binary Parser Tests (20 tests)
+*Files: `tests/media_validation.test.mjs`, `tests/preview_protocol.test.mjs`, `tests/public_fallback_and_renderers.test.mjs`, `tests/reorder_validation.test.mjs`*
+- **Binary Signature & Dimensions (7 tests)**: Magic bytes (`FF D8 FF`, `89 50 4E 47`, `RIFF...WEBP`), header chunk dimension extraction (SOF0/SOF2, IHDR, VP8), rejection of MIME spoofing (MZ executable disguised as JPEG) and oversized files (> 5MB).
+- **Preview Protocol & Handshake (5 tests)**: Sandboxed iframe preview handshake (`READY` -> `ACK` -> `INIT`), message origin validation, source window validation, section selection dispatching.
+- **Public Fallback & Renderers (5 tests)**: Preservation of GTM (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`), fallback HTML structure, and DOM generation for all 9 supported section types.
+- **Section Reordering Logic (5 tests)**: Reorder array validation (no nulls, no duplicates, no unknown IDs, no omitted IDs, monotonic 10-step permutation generation).
 
-5. **`tests/media_validation.test.mjs` (7 tests)**:
-   - Binary magic signature verification, MIME mismatch detection, file size limits, dimension limits.
+#### Category 3: Simulated Interface & State Contract Tests (34 tests)
+*Files: `tests/integration_edge_function_upload.test.mjs` (11 tests), `tests/integration_draft_persistence_and_locking.test.mjs` (6 tests), `tests/integration_auth_and_mfa.test.mjs` (7 tests), `tests/snapshot_integrity.test.mjs` (8 tests)*
+- **MFA Consistency & Parity (5 tests)**: Rejection of invalid/expired session (401), rejection of AAL1 session (403), rejection of AAL2 session lacking verified TOTP factor (403), rejection of non-admin user (403), acceptance of AAL2 with verified TOTP factor and `super_admin` profile (201).
+- **Storage & RPC Bypass Closure (6 tests)**: Rejection of direct client Storage INSERT via RLS, rejection of dropped `validate_and_register_media_asset` RPC, rejection of forged JPEG SOI headers, rejection of disguised executables, hiding of unindexed objects via SELECT RLS, rollback of storage object on simulated DB insert failure.
+- **Draft Persistence & Locking Contract (6 tests)**: Concurrency lock serialization, section additions and deletions sync, reordering RPC sequential ordering, full draft snapshot capture (including hidden sections), abort on persistence failure, atomic draft save contract.
+- **Supabase Auth & Session Lifecycle (7 tests)**: Invalid credential rejection, AAL1 authentication & MFA factor detection, invalid TOTP code rejection, session upgrade to AAL2, `super_admin` role validation, non-admin rejection, session clearance on logout.
+- **Snapshot Publishing & Restoration Resiliency (8 tests)**: Publishing validation (zero sections, all hidden, missing phone, missing Arabic title), restoration resiliency against null, missing, or malformed fields.
 
-6. **`tests/preview_protocol.test.mjs` (5 tests)**:
-   - Sandboxed iframe preview handshake, source and origin security validation, message schema validation.
+#### Category 4: Staging Safety Guards & Harness Unit Tests (15 tests)
+*File: `tests/staging_safety_and_harness.test.mjs`*
+- **Staging Allowlist & Anti-Production Guards (3 tests)**: Rejection of production project references, rejection of unknown arbitrary projects, strict enforcement of `STAGING_PROJECT_ALLOWLIST`, acceptance of valid staging/dev references.
+- **Codebase Static Asset Scanner & Root Validation (3 tests)**: Fails closed when repository root is missing or unverified, fails closed when any of `index.html`, `package.json`, `supabase/`, `js/`, `css/`, or explicit required asset directories (`Img`, `Img-2`, `Img - 3`, `Logo`, `assets`) is missing, recursively scans and protects full paths and basenames.
+- **Strict Report Schema & Live Storage Comparison (2 tests)**: Validates complete schema `3.10`, enforces positive integer size, rejects missing/unknown mime types, rejects duplicate paths, compares full candidate sets against live storage (count, paths, sizes, and MIMEs).
+- **Staging Report Tracker, Teardown Integrity & Non-Zero Exit Code Policy (5 tests)**: Asserts exit code 1 when configurations are missing, asserts exit code 1 when any test is skipped, asserts exit code 1 when any test fails, asserts exit code 1 when teardown fails (dangling artifacts detected), asserts exit code 0 strictly on 100% pass rate with clean teardown.
+- **RFC 6238 TOTP Generator (2 tests)**: Validates base32 decoding against RFC 4648 test vector and rejects invalid characters, validates 6-digit numeric TOTP code generation consistency.
 
-7. **`tests/public_fallback_and_renderers.test.mjs` (5 tests)**:
-   - Verifies preservation of Google Tag Manager (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`).
-   - Verifies all 9 section renderers generate valid DOM strings with tracking attributes.
+---
 
-8. **`tests/reorder_validation.test.mjs` (5 tests)**:
-   - Reorder input validation (no duplicates, no unknowns, no omissions, sequential 10-step permutation).
+## 📋 Live Staging Verification Suite & Runbook
 
-9. **`tests/snapshot_integrity.test.mjs` (8 tests)**:
-   - Publishing validation (zero sections, all hidden, missing required fields).
-   - Restoration resiliency against missing, null, or malformed fields.
+For real end-to-end integration verification on a live Supabase Staging environment (verifying real PostgreSQL 15+ engine evaluation, real GoTrue cryptographic JWT signatures, and live Edge Function execution):
+
+### 1. Hardened Staging Verification Suite
+Execute the dedicated staging test runner at [`scripts/verify_staging_integration.mjs`](scripts/verify_staging_integration.mjs):
+
+```bash
+STAGING_SUPABASE_URL=https://<staging-ref>.supabase.co \
+STAGING_SUPABASE_ANON_KEY=<valid-anon-key> \
+STAGING_SERVICE_ROLE_KEY=<service-role-secret> \
+STAGING_ADMIN_EMAIL=admin@mg-home.online \
+STAGING_ADMIN_PASSWORD=SecretPassword123! \
+STAGING_ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+STAGING_UNVERIFIED_MFA_TOKEN=<optional-aal2-token-without-totp> \
+node scripts/verify_staging_integration.mjs
+```
+
+This live script automatically executes:
+1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects` with explicit RLS error verification.
+2. **Anonymous Access Rejection**: Asserts unauthenticated requests to `is_admin_aal2()` return `false` and draft mutations fail.
+3. **Dropped RPC Non-Existence (HTTP 404)**: Confirms `validate_and_register_media_asset` is completely dropped from PostgreSQL.
+4. **Live AAL1 Session Rejection (Strict HTTP 403)**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction` with verified HTTP 403 permission denial message (rejects generic HTTP 400).
+5. **Real TOTP Challenge & Authentic AAL2 Upgrade**: Generates real RFC 6238 TOTP 6-digit codes to verify MFA challenge and obtain authentic AAL2 JWT from Supabase GoTrue.
+6. **Authentic is_admin_aal2() Approval**: Confirms super_admin with verified AAL2 session returns `true`.
+7. **Complete 3-Table Snapshot ACID Rollback under Authentic Admin AAL2 Session**: Uses `display_order` to query sections, asserts `res.ok` on all baseline queries, submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws exception `22000` (`VALIDATION ERROR`), and verifies that all three draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) reverted to their baseline snapshots with zero partial mutation across all fields.
+8. **Live Edge Function HTTP Suite (`validate-image`)**:
+   - Asserts HTTP 401 on missing auth.
+   - Asserts strict HTTP 403 on AAL1 session.
+   - Asserts strict HTTP 403 on authentic AAL2 session lacking verified TOTP factor (reports as NOT CONFIGURED if neither `STAGING_UNVERIFIED_MFA_TOKEN` nor `STAGING_SUPABASE_JWT_SECRET` is provisioned; never claims pass without real cryptographic proof).
+   - Asserts HTTP 201 on valid JPEG upload, and performs independent GET verification directly from Storage and DB.
+   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and performs complete paginated Storage scanning and direct lookup proving ZERO storage object and ZERO DB row created.
+9. **Hardened Teardown Integrity**: Runs inside a `finally` block to ensure execution, verifies HTTP status of deletions, executes independent post-delete queries to confirm both Storage object and DB record are absent, tracks cleanup failures in the report summary, and produces a non-zero exit code if cleanup fails.
+10. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED`, `TEARDOWN FAILURES` and exits with non-zero code (1) if any test fails, is skipped, is unconfigured, or fails teardown.
+
+### 2. Manual Staging Verification Checklist
+Before production cutover, perform these physical verification steps on Staging:
+
+1. **Database Migration Execution**:
+   - Apply [`supabase/migrations/20261119000001_initial_schema_v2_3_0.sql`](supabase/migrations/20261119000001_initial_schema_v2_3_0.sql) on a clean Supabase Staging PostgreSQL instance. Confirm zero errors.
+2. **Initial Admin Provisioning**:
+   - Create a user in Supabase Auth Dashboard, then run `SELECT public.provision_initial_admin('<UID>'::uuid, 'Radwan Eldaly');` using the SQL Editor.
+3. **Physical TOTP MFA Enrollment**:
+   - Log in to Admin Studio, scan the QR code using Google Authenticator on a physical mobile device, enter the 6-digit TOTP code, and verify session upgrade to AAL2.
+4. **Deploy Edge Function**:
+   - Run `supabase functions deploy validate-image` and set `SUPABASE_SERVICE_ROLE_KEY`.
+   - Upload a test photo through Admin Studio and verify HTTP 201 response and object creation in storage.
+5. **Orphaned Storage Audit & Cleanup**:
+   - Run `node scripts/cleanup_orphaned_media.mjs` against Staging to ensure zero orphaned files exist.
+6. **Live End-to-End Visual Builder Publish Flow**:
+   - Open Visual Builder, edit Hero section title and background.
+   - Click "Save Draft", verify atomic persistence in database.
+   - Click "Publish", verify new active revision created in `page_revisions`.
+   - Open public website in an incognito window without login, verify updated title loads within 1500ms.
+   - Verify GTM container (`GTM-KVDSVFG5`) and Google Ads (`AW-18574001849`) fire correctly.
