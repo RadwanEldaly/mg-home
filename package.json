@@ -1,0 +1,13 @@
+{
+  "name": "mg-home",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MG HOME — Custom CMS and landing page",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build:admin": "npm --prefix admin run build",
+    "cleanup:dry": "node scripts/cleanup_orphaned_media.mjs --dry-run",
+    "verify:staging": "node scripts/verify_staging_integration.mjs"
+  }
+}

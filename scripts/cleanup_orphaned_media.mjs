@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================================
-// MG HOME CMS — Staging Orphaned Storage Objects Cleanup Tool (Phase 03.9 Hardened)
+// MG HOME CMS — Staging Orphaned Storage Objects Cleanup Tool (Phase 03.10 Hardened)
 // File: scripts/cleanup_orphaned_media.mjs
 // Run: node scripts/cleanup_orphaned_media.mjs [--dry-run|--delete --confirm-staging-project=<ref> --report=<report.json>]
 // ============================================================================
@@ -9,17 +9,21 @@
 // 1. Mandatory Staging Project Allowlist:
 //    STAGING_PROJECT_ALLOWLIST is mandatory in ALL cases. No fuzzy fallback allowed.
 //    Rejects Production and unknown projects unconditionally.
-// 2. Recursive Codebase Scanning (fail-closed):
-//    Recursively scans index.html, js/, css/, Img/, Img-2/, Img - 3/, Logo/, assets/.
-//    Protects both full paths and basenames.
-// 3. Strict Full-Metadata Report Comparison:
-//    Requires --report=<report.json>. Validates schema, project_ref, target_url,
-//    and compares paths, sizes, and MIME types. Aborts if live storage changed.
-// 4. Recursive Storage Enumeration:
+// 2. Strict Repository Root & Codebase Verification (fail-closed):
+//    Explicitly verifies index.html, package.json, supabase/, js/, css/,
+//    and explicit required asset directories (Img, Img-2, Img - 3, Logo, assets).
+//    Recursively scans public codebase and protects normalized paths and basenames.
+// 3. Strict Full-Metadata Report Schema Validation:
+//    Requires --report=<report.json>. Validates schema_version '3.10', project_ref,
+//    target_url, timestamps, and requires orphaned_candidates to be a non-empty array
+//    with strict size, mimetype, and duplicate path rejection.
+// 4. Candidate Set Comparison with Live Storage:
+//    Compares approved candidates against live storage on count, paths, sizes, and MIMEs.
+// 5. Recursive Storage Enumeration:
 //    Recursively enumerates all subdirectories in media-library bucket.
-// 5. Deterministic Database Pagination:
+// 6. Deterministic Database Pagination:
 //    Uses order=storage_path.asc to guarantee zero skipped records.
-// 6. Safe Storage API Deletion:
+// 7. Safe Storage API Deletion:
 //    Deletes via storage.from('media-library').remove([paths]).
 // ============================================================================
 
@@ -78,18 +82,44 @@ export function validateStagingTarget(ref, allowlist) {
 // ----------------------------------------------------------------------------
 // SAFETY GUARD 2: Fail-Closed Recursive Codebase Static Asset Scanner
 // ----------------------------------------------------------------------------
-export function scanCodebaseProtectedAssets(rootDir = process.cwd()) {
-  const indexHtmlPath = path.join(rootDir, 'index.html');
-  const requiredDirs = ['js', 'css'];
+export const REQUIRED_ROOT_FILES = ['index.html', 'package.json'];
+export const REQUIRED_ROOT_DIRS = ['supabase', 'js', 'css'];
+export const REQUIRED_ASSET_DIRS = ['Img', 'Img-2', 'Img - 3', 'Logo', 'assets'];
 
-  // Verify repository root
-  if (!fs.existsSync(indexHtmlPath)) {
-    throw new Error('FAIL-CLOSED: Cannot verify repository root. Missing index.html.');
+export function scanCodebaseProtectedAssets(rootDir = process.cwd()) {
+  // 1. Verify required root files (fail-closed)
+  for (const rf of REQUIRED_ROOT_FILES) {
+    const filePath = path.join(rootDir, rf);
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Missing required root file: "${rf}".`);
+    }
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Path "${rf}" is not a regular file.`);
+    }
   }
 
-  for (const d of requiredDirs) {
-    if (!fs.existsSync(path.join(rootDir, d))) {
-      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Missing "${d}" directory.`);
+  // 2. Verify required root directories (fail-closed)
+  for (const rd of REQUIRED_ROOT_DIRS) {
+    const dirPath = path.join(rootDir, rd);
+    if (!fs.existsSync(dirPath)) {
+      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Missing required root directory: "${rd}".`);
+    }
+    const stat = fs.statSync(dirPath);
+    if (!stat.isDirectory()) {
+      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Path "${rd}" is not a directory.`);
+    }
+  }
+
+  // 3. Verify explicit required asset directories (fail-closed)
+  for (const ad of REQUIRED_ASSET_DIRS) {
+    const assetPath = path.join(rootDir, ad);
+    if (!fs.existsSync(assetPath)) {
+      throw new Error(`FAIL-CLOSED: Missing required asset directory: "${ad}".`);
+    }
+    const stat = fs.statSync(assetPath);
+    if (!stat.isDirectory()) {
+      throw new Error(`FAIL-CLOSED: Required asset directory "${ad}" is not a directory.`);
     }
   }
 
@@ -138,22 +168,174 @@ export function scanCodebaseProtectedAssets(rootDir = process.cwd()) {
   }
 
   // 1. Scan index.html
-  scanTextFile(indexHtmlPath);
+  scanTextFile(path.join(rootDir, 'index.html'));
 
   // 2. Scan code directories recursively
   scanDirectoryRecursive(path.join(rootDir, 'js'));
   scanDirectoryRecursive(path.join(rootDir, 'css'));
 
   // 3. Scan physical asset directories recursively
-  const assetDirs = ['Img', 'Img-2', 'Img - 3', 'Logo', 'assets'];
-  for (const ad of assetDirs) {
+  for (const ad of REQUIRED_ASSET_DIRS) {
     const fullDirPath = path.join(rootDir, ad);
-    if (fs.existsSync(fullDirPath)) {
-      scanDirectoryRecursive(fullDirPath);
-    }
+    scanDirectoryRecursive(fullDirPath);
   }
 
   return { protectedPaths, protectedBasenames };
+}
+
+// ----------------------------------------------------------------------------
+// SAFETY GUARD 3: Strict Full-Metadata Report Validation (fail-closed)
+// ----------------------------------------------------------------------------
+export function validateCleanupReport(report, expectedContext = {}) {
+  if (!report || typeof report !== 'object') {
+    return { valid: false, error: 'Report must be a non-null JSON object.' };
+  }
+
+  const expectedSchema = expectedContext.expectedSchemaVersion || '3.10';
+  if (!report.schema_version || report.schema_version !== expectedSchema) {
+    return {
+      valid: false,
+      error: `Report schema_version "${report.schema_version}" is incompatible (expected "${expectedSchema}").`
+    };
+  }
+
+  if (!report.project_ref || typeof report.project_ref !== 'string' || report.project_ref.trim() === '') {
+    return { valid: false, error: 'Missing or invalid project_ref in report.' };
+  }
+  if (expectedContext.projectRef && report.project_ref.toLowerCase() !== expectedContext.projectRef.toLowerCase()) {
+    return {
+      valid: false,
+      error: `Report project_ref "${report.project_ref}" does not match target project "${expectedContext.projectRef}".`
+    };
+  }
+
+  if (!report.target_url || typeof report.target_url !== 'string' || report.target_url.trim() === '') {
+    return { valid: false, error: 'Missing or invalid target_url in report.' };
+  }
+  if (expectedContext.targetUrl && report.target_url !== expectedContext.targetUrl) {
+    return {
+      valid: false,
+      error: `Report target_url "${report.target_url}" does not match target URL "${expectedContext.targetUrl}".`
+    };
+  }
+
+  if (!report.generated_at || typeof report.generated_at !== 'string' || isNaN(Date.parse(report.generated_at))) {
+    return { valid: false, error: 'Report generated_at timestamp is invalid or missing.' };
+  }
+
+  if (typeof report.total_objects !== 'number' || report.total_objects < 0 || !Number.isInteger(report.total_objects)) {
+    return { valid: false, error: 'Report total_objects must be a non-negative integer.' };
+  }
+  if (typeof report.kept_count !== 'number' || report.kept_count < 0 || !Number.isInteger(report.kept_count)) {
+    return { valid: false, error: 'Report kept_count must be a non-negative integer.' };
+  }
+  if (typeof report.candidate_count !== 'number' || report.candidate_count < 0 || !Number.isInteger(report.candidate_count)) {
+    return { valid: false, error: 'Report candidate_count must be a non-negative integer.' };
+  }
+
+  if (!Array.isArray(report.orphaned_candidates)) {
+    return { valid: false, error: 'orphaned_candidates must be an array.' };
+  }
+  if (report.orphaned_candidates.length !== report.candidate_count) {
+    return {
+      valid: false,
+      error: `orphaned_candidates count (${report.orphaned_candidates.length}) does not match candidate_count (${report.candidate_count}).`
+    };
+  }
+
+  const seenPaths = new Set();
+  for (let i = 0; i < report.orphaned_candidates.length; i++) {
+    const c = report.orphaned_candidates[i];
+    if (!c || typeof c !== 'object') {
+      return { valid: false, error: `Candidate entry at index ${i} is not a valid object.` };
+    }
+    if (!c.path || typeof c.path !== 'string' || c.path.trim() === '') {
+      return { valid: false, error: `Candidate at index ${i} has missing or empty path.` };
+    }
+    const normPath = c.path.trim();
+    if (seenPaths.has(normPath)) {
+      return { valid: false, error: `Duplicate candidate path detected in report: "${normPath}".` };
+    }
+    seenPaths.add(normPath);
+
+    if (typeof c.size_bytes !== 'number' || c.size_bytes <= 0 || !Number.isInteger(c.size_bytes)) {
+      return { valid: false, error: `Candidate "${c.path}" has invalid size_bytes (${c.size_bytes}). Must be a positive integer.` };
+    }
+    if (!c.mimetype || typeof c.mimetype !== 'string' || c.mimetype.trim() === '' || c.mimetype === 'unknown') {
+      return { valid: false, error: `Candidate "${c.path}" has missing or invalid mimetype (${c.mimetype}).` };
+    }
+    if (!c.created_at || typeof c.created_at !== 'string' || isNaN(Date.parse(c.created_at))) {
+      return { valid: false, error: `Candidate "${c.path}" has missing or invalid created_at timestamp.` };
+    }
+  }
+
+  return { valid: true };
+}
+
+// ----------------------------------------------------------------------------
+// SAFETY GUARD 4: Candidate Set Comparison Against Live Storage
+// ----------------------------------------------------------------------------
+export function compareReportAgainstLive(approvedCandidates, liveCandidates) {
+  if (!Array.isArray(approvedCandidates) || !Array.isArray(liveCandidates)) {
+    return { valid: false, error: 'Both approvedCandidates and liveCandidates must be arrays.' };
+  }
+
+  if (approvedCandidates.length !== liveCandidates.length) {
+    return {
+      valid: false,
+      error: `Candidate count changed between audit and execution! Approved report: ${approvedCandidates.length}, Live storage: ${liveCandidates.length}.`
+    };
+  }
+
+  const approvedMap = new Map();
+  for (const c of approvedCandidates) {
+    approvedMap.set(c.path, c);
+  }
+
+  const liveMap = new Map();
+  for (const c of liveCandidates) {
+    const key = c.name || c.path;
+    liveMap.set(key, c);
+  }
+
+  if (approvedMap.size !== liveMap.size) {
+    return {
+      valid: false,
+      error: `Distinct candidate count mismatch: approved report has ${approvedMap.size}, live has ${liveMap.size}.`
+    };
+  }
+
+  for (const [pathName, liveItem] of liveMap.entries()) {
+    const approvedItem = approvedMap.get(pathName);
+    if (!approvedItem) {
+      return { valid: false, error: `Live storage contains orphan "${pathName}" not present in approved report!` };
+    }
+    const liveSize = liveItem.size_bytes ?? liveItem.size;
+    if (approvedItem.size_bytes !== liveSize) {
+      return {
+        valid: false,
+        error: `Object "${pathName}" size changed between audit and execution (Report: ${approvedItem.size_bytes}, Live: ${liveSize})!`
+      };
+    }
+    const liveMime = liveItem.mimetype || liveItem.mimeType;
+    if (approvedItem.mimetype !== liveMime) {
+      return {
+        valid: false,
+        error: `Object "${pathName}" mimetype changed between audit and execution (Report: ${approvedItem.mimetype}, Live: ${liveMime})!`
+      };
+    }
+  }
+
+  for (const [pathName] of approvedMap.entries()) {
+    if (!liveMap.has(pathName)) {
+      return {
+        valid: false,
+        error: `Approved orphan "${pathName}" is no longer present in live storage candidate list!`
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 // ----------------------------------------------------------------------------
@@ -367,7 +549,7 @@ export async function main() {
   const reportPath = path.resolve(reportOutputName);
 
   const reportPayload = {
-    schema_version: '3.9',
+    schema_version: '3.10',
     project_ref: projectRef,
     target_url: SUPABASE_URL,
     generated_at: new Date().toISOString(),
@@ -405,7 +587,7 @@ export async function main() {
   }
 
   // --------------------------------------------------------------------------
-  // SAFETY GUARD 3: Strict Full-Metadata Report Comparison Before Deletion
+  // SAFETY GUARD 3 & 4: Strict Full-Metadata Report Validation & Comparison
   // --------------------------------------------------------------------------
   console.log('\nStep 6: Performing comprehensive report validation & candidate set comparison...');
   let approvedReport;
@@ -417,65 +599,25 @@ export async function main() {
     process.exit(1);
   }
 
-  // 1. Validate report schema version
-  if (!approvedReport.schema_version || approvedReport.schema_version !== '3.9') {
-    console.error(`❌ Report schema_version "${approvedReport.schema_version}" is incompatible (expected "3.9"). Aborting.`);
+  // 1. Strict schema and metadata validation
+  const reportValidation = validateCleanupReport(approvedReport, {
+    projectRef,
+    targetUrl: SUPABASE_URL,
+    expectedSchemaVersion: '3.10'
+  });
+  if (!reportValidation.valid) {
+    console.error(`\n🛑 SAFETY ABORT: Report validation failed: ${reportValidation.error}\n`);
     process.exit(1);
   }
 
-  // 2. Validate project_ref
-  if (approvedReport.project_ref !== projectRef) {
-    console.error(`❌ Report project_ref "${approvedReport.project_ref}" does not match target project "${projectRef}". Aborting.`);
+  // 2. Strict comparison against live storage
+  const compareResult = compareReportAgainstLive(approvedReport.orphaned_candidates, candidateList);
+  if (!compareResult.valid) {
+    console.error(`\n🛑 SAFETY ABORT: Live storage comparison failed: ${compareResult.error}\n`);
     process.exit(1);
   }
 
-  // 3. Validate target_url
-  if (approvedReport.target_url !== SUPABASE_URL) {
-    console.error(`❌ Report target_url "${approvedReport.target_url}" does not match current SUPABASE_URL. Aborting.`);
-    process.exit(1);
-  }
-
-  // 4. Validate generated_at timestamp existence
-  if (!approvedReport.generated_at || isNaN(Date.parse(approvedReport.generated_at))) {
-    console.error('❌ Report generated_at timestamp is invalid or missing. Aborting.');
-    process.exit(1);
-  }
-
-  // 5. Compare full candidate metadata (path, size_bytes, mimetype)
-  const approvedMap = new Map();
-  for (const c of approvedReport.orphaned_candidates || []) {
-    approvedMap.set(c.path, c);
-  }
-
-  const liveMap = new Map();
-  for (const c of candidateList) {
-    liveMap.set(c.name, c);
-  }
-
-  if (approvedMap.size !== liveMap.size) {
-    console.error('\n🛑 SAFETY ABORT: Candidate count changed between audit and execution!');
-    console.error(`   Approved report count : ${approvedMap.size}`);
-    console.error(`   Current live count    : ${liveMap.size}`);
-    process.exit(1);
-  }
-
-  for (const [pathName, liveItem] of liveMap.entries()) {
-    const approvedItem = approvedMap.get(pathName);
-    if (!approvedItem) {
-      console.error(`\n🛑 SAFETY ABORT: Live storage contains new orphan "${pathName}" not in approved report!`);
-      process.exit(1);
-    }
-    if (approvedItem.size_bytes !== liveItem.size_bytes) {
-      console.error(`\n🛑 SAFETY ABORT: Object "${pathName}" size changed (report: ${approvedItem.size_bytes}, live: ${liveItem.size_bytes})!`);
-      process.exit(1);
-    }
-    if (approvedItem.mimetype !== liveItem.mimetype) {
-      console.error(`\n🛑 SAFETY ABORT: Object "${pathName}" mimetype changed (report: ${approvedItem.mimetype}, live: ${liveItem.mimetype})!`);
-      process.exit(1);
-    }
-  }
-
-  console.log(`   Verification successful: Live candidate set matches approved report 100% on paths, sizes, and MIME types (${liveMap.size} objects).`);
+  console.log(`   Verification successful: Live candidate set matches approved report 100% on paths, sizes, and MIME types (${approvedReport.orphaned_candidates.length} objects).`);
 
   // Step 7: Batch Deletion via Storage API (.remove([paths]))
   console.log('\nStep 7: Executing safe batch deletion via Supabase Storage API...');

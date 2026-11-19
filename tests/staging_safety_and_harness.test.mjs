@@ -1,5 +1,5 @@
 // ============================================================================
-// MG HOME CMS — Staging Safety Guards & Harness Unit Test Suite (Phase 03.8)
+// MG HOME CMS — Staging Safety Guards & Harness Unit Test Suite (Phase 03.10)
 // File: tests/staging_safety_and_harness.test.mjs
 // Run: node --test tests/staging_safety_and_harness.test.mjs
 // ============================================================================
@@ -12,7 +12,12 @@ import fs from 'node:fs';
 
 import {
   validateStagingTarget,
-  scanCodebaseProtectedAssets
+  scanCodebaseProtectedAssets,
+  validateCleanupReport,
+  compareReportAgainstLive,
+  REQUIRED_ROOT_FILES,
+  REQUIRED_ROOT_DIRS,
+  REQUIRED_ASSET_DIRS
 } from '../scripts/cleanup_orphaned_media.mjs';
 
 import {
@@ -59,9 +64,9 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
   });
 
   // --------------------------------------------------------------------------
-  // Group 2: Codebase Static Asset Scanner (Fail-Closed)
+  // Group 2: Codebase Static Asset Scanner & Root Validation (Fail-Closed)
   // --------------------------------------------------------------------------
-  it('scanCodebaseProtectedAssets must fail closed if repository root is invalid', () => {
+  it('scanCodebaseProtectedAssets must fail closed if repository root is empty', () => {
     const emptyTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mg-test-empty-'));
     try {
       assert.throws(
@@ -70,6 +75,65 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
       );
     } finally {
       fs.rmSync(emptyTempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('scanCodebaseProtectedAssets must fail closed when any required root file or directory is missing', () => {
+    function createMockRepo(excludeItem) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mg-mock-repo-'));
+      if (excludeItem !== 'index.html') fs.writeFileSync(path.join(tmp, 'index.html'), '<html></html>', 'utf8');
+      if (excludeItem !== 'package.json') fs.writeFileSync(path.join(tmp, 'package.json'), '{}', 'utf8');
+      if (excludeItem !== 'supabase') fs.mkdirSync(path.join(tmp, 'supabase'));
+      if (excludeItem !== 'js') fs.mkdirSync(path.join(tmp, 'js'));
+      if (excludeItem !== 'css') fs.mkdirSync(path.join(tmp, 'css'));
+      for (const ad of REQUIRED_ASSET_DIRS) {
+        if (excludeItem !== ad) fs.mkdirSync(path.join(tmp, ad));
+      }
+      return tmp;
+    }
+
+    // 1. Missing package.json
+    const tmpNoPkg = createMockRepo('package.json');
+    try {
+      assert.throws(
+        () => scanCodebaseProtectedAssets(tmpNoPkg),
+        /Missing required root file: "package\.json"/
+      );
+    } finally {
+      fs.rmSync(tmpNoPkg, { recursive: true, force: true });
+    }
+
+    // 2. Missing supabase/ directory
+    const tmpNoSupabase = createMockRepo('supabase');
+    try {
+      assert.throws(
+        () => scanCodebaseProtectedAssets(tmpNoSupabase),
+        /Missing required root directory: "supabase"/
+      );
+    } finally {
+      fs.rmSync(tmpNoSupabase, { recursive: true, force: true });
+    }
+
+    // 3. Missing js/ directory
+    const tmpNoJs = createMockRepo('js');
+    try {
+      assert.throws(
+        () => scanCodebaseProtectedAssets(tmpNoJs),
+        /Missing required root directory: "js"/
+      );
+    } finally {
+      fs.rmSync(tmpNoJs, { recursive: true, force: true });
+    }
+
+    // 4. Missing required asset directory (e.g. Logo)
+    const tmpNoLogo = createMockRepo('Logo');
+    try {
+      assert.throws(
+        () => scanCodebaseProtectedAssets(tmpNoLogo),
+        /Missing required asset directory: "Logo"/
+      );
+    } finally {
+      fs.rmSync(tmpNoLogo, { recursive: true, force: true });
     }
   });
 
@@ -92,60 +156,145 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
     assert.ok(hasAnyImageProtected, 'Must protect image assets recursively');
   });
 
-  it('Report validation must compare full metadata (paths, sizes, MIME types)', () => {
-    const approvedReport = {
-      schema_version: '3.9',
+  // --------------------------------------------------------------------------
+  // Group 3: Strict Cleanup Report Validation (validateCleanupReport)
+  // --------------------------------------------------------------------------
+  it('validateCleanupReport must enforce complete schema and reject malformed reports', () => {
+    const validReport = {
+      schema_version: '3.10',
       project_ref: 'mg-staging-test',
       target_url: 'https://mg-staging-test.supabase.co',
       generated_at: new Date().toISOString(),
+      total_objects: 2,
+      kept_count: 0,
+      candidate_count: 2,
       orphaned_candidates: [
-        { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
-        { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+        { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg', created_at: new Date().toISOString() },
+        { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png', created_at: new Date().toISOString() }
       ]
     };
 
-    // Helper validating candidate set equality (mirroring cleanup tool logic)
-    function validateReportCandidates(approved, liveCandidates) {
-      if (approved.schema_version !== '3.9') return { valid: false, error: 'Schema mismatch' };
-      if (approved.orphaned_candidates.length !== liveCandidates.length) {
-        return { valid: false, error: 'Count mismatch' };
-      }
-      const approvedMap = new Map(approved.orphaned_candidates.map((c) => [c.path, c]));
-      for (const live of liveCandidates) {
-        const match = approvedMap.get(live.path);
-        if (!match) return { valid: false, error: 'Path mismatch' };
-        if (match.size_bytes !== live.size_bytes) return { valid: false, error: 'Size mismatch' };
-        if (match.mimetype !== live.mimetype) return { valid: false, error: 'Mimetype mismatch' };
-      }
-      return { valid: true };
-    }
+    const ctx = { projectRef: 'mg-staging-test', targetUrl: 'https://mg-staging-test.supabase.co', expectedSchemaVersion: '3.10' };
 
-    // 1. Identical candidate set
-    const identicalLive = [
-      { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
-      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
-    ];
-    assert.equal(validateReportCandidates(approvedReport, identicalLive).valid, true);
+    // Valid report passes
+    assert.equal(validateCleanupReport(validReport, ctx).valid, true);
 
-    // 2. Modified size
-    const tamperedSize = [
-      { path: 'uploads/orphan1.jpg', size_bytes: 9999, mimetype: 'image/jpeg' },
-      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
-    ];
-    assert.equal(validateReportCandidates(approvedReport, tamperedSize).valid, false);
-    assert.equal(validateReportCandidates(approvedReport, tamperedSize).error, 'Size mismatch');
+    // 1. Incompatible schema version
+    const invalidSchema = { ...validReport, schema_version: '2.0' };
+    const resSchema = validateCleanupReport(invalidSchema, ctx);
+    assert.equal(resSchema.valid, false);
+    assert.match(resSchema.error, /incompatible/);
 
-    // 3. Modified MIME type
-    const tamperedMime = [
-      { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'application/octet-stream' },
-      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
-    ];
-    assert.equal(validateReportCandidates(approvedReport, tamperedMime).valid, false);
-    assert.equal(validateReportCandidates(approvedReport, tamperedMime).error, 'Mimetype mismatch');
+    // 2. Mismatched project_ref
+    const wrongRef = { ...validReport, project_ref: 'other-project' };
+    const resRef = validateCleanupReport(wrongRef, ctx);
+    assert.equal(resRef.valid, false);
+    assert.match(resRef.error, /does not match target project/);
+
+    // 3. Mismatched target_url
+    const wrongUrl = { ...validReport, target_url: 'https://evil.supabase.co' };
+    const resUrl = validateCleanupReport(wrongUrl, ctx);
+    assert.equal(resUrl.valid, false);
+    assert.match(resUrl.error, /does not match target URL/);
+
+    // 4. Non-array orphaned_candidates
+    const nonArrayCandidates = { ...validReport, orphaned_candidates: 'not-an-array' };
+    const resNonArray = validateCleanupReport(nonArrayCandidates, ctx);
+    assert.equal(resNonArray.valid, false);
+    assert.match(resNonArray.error, /orphaned_candidates must be an array/);
+
+    // 5. Duplicate candidate paths
+    const duplicatePathReport = {
+      ...validReport,
+      candidate_count: 2,
+      orphaned_candidates: [
+        { path: 'uploads/dup.jpg', size_bytes: 100, mimetype: 'image/jpeg', created_at: new Date().toISOString() },
+        { path: 'uploads/dup.jpg', size_bytes: 100, mimetype: 'image/jpeg', created_at: new Date().toISOString() }
+      ]
+    };
+    const resDup = validateCleanupReport(duplicatePathReport, ctx);
+    assert.equal(resDup.valid, false);
+    assert.match(resDup.error, /Duplicate candidate path detected/);
+
+    // 6. Invalid size_bytes (zero or negative)
+    const invalidSizeReport = {
+      ...validReport,
+      candidate_count: 1,
+      orphaned_candidates: [
+        { path: 'uploads/zero.jpg', size_bytes: 0, mimetype: 'image/jpeg', created_at: new Date().toISOString() }
+      ]
+    };
+    const resSize = validateCleanupReport(invalidSizeReport, { ...ctx, candidateCount: 1 });
+    assert.equal(resSize.valid, false);
+    assert.match(resSize.error, /invalid size_bytes/);
+
+    // 7. Missing or unknown mimetype
+    const missingMimeReport = {
+      ...validReport,
+      candidate_count: 1,
+      orphaned_candidates: [
+        { path: 'uploads/nomime.jpg', size_bytes: 500, mimetype: 'unknown', created_at: new Date().toISOString() }
+      ]
+    };
+    const resMime = validateCleanupReport(missingMimeReport, ctx);
+    assert.equal(resMime.valid, false);
+    assert.match(resMime.error, /missing or invalid mimetype/);
   });
 
   // --------------------------------------------------------------------------
-  // Group 3: Staging Report Tracker & Non-Zero Exit Code Enforcement
+  // Group 4: Candidate Set Comparison with Live Storage (compareReportAgainstLive)
+  // --------------------------------------------------------------------------
+  it('compareReportAgainstLive must enforce exact match of count, paths, sizes, and MIME types', () => {
+    const approvedCandidates = [
+      { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
+      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+
+    // 1. Identical candidate set
+    const identicalLive = [
+      { name: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
+      { name: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    assert.equal(compareReportAgainstLive(approvedCandidates, identicalLive).valid, true);
+
+    // 2. Count mismatch
+    const countMismatchLive = [
+      { name: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' }
+    ];
+    const resCount = compareReportAgainstLive(approvedCandidates, countMismatchLive);
+    assert.equal(resCount.valid, false);
+    assert.match(resCount.error, /Candidate count changed/);
+
+    // 3. Modified size
+    const tamperedSizeLive = [
+      { name: 'uploads/orphan1.jpg', size_bytes: 9999, mimetype: 'image/jpeg' },
+      { name: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    const resSize = compareReportAgainstLive(approvedCandidates, tamperedSizeLive);
+    assert.equal(resSize.valid, false);
+    assert.match(resSize.error, /size changed/);
+
+    // 4. Modified MIME type
+    const tamperedMimeLive = [
+      { name: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'application/octet-stream' },
+      { name: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    const resMime = compareReportAgainstLive(approvedCandidates, tamperedMimeLive);
+    assert.equal(resMime.valid, false);
+    assert.match(resMime.error, /mimetype changed/);
+
+    // 5. Unknown orphan in live storage
+    const newOrphanLive = [
+      { name: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
+      { name: 'uploads/unexpected.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    const resNew = compareReportAgainstLive(approvedCandidates, newOrphanLive);
+    assert.equal(resNew.valid, false);
+    assert.match(resNew.error, /not present in approved report/);
+  });
+
+  // --------------------------------------------------------------------------
+  // Group 5: Staging Report Tracker, Teardown Integrity & Exit Codes
   // --------------------------------------------------------------------------
   it('StagingReportTracker must return non-zero exit code when configurations are missing', () => {
     const tracker = new StagingReportTracker();
@@ -170,16 +319,27 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
     assert.equal(exitCode, 1, 'Must return 1 when any test fails');
   });
 
-  it('StagingReportTracker must return 0 only when all tests pass with zero skips or failures', () => {
+  it('StagingReportTracker must return non-zero exit code when teardown / cleanup fails', () => {
+    const tracker = new StagingReportTracker();
+    tracker.pass('Test 1 Passed');
+    tracker.pass('Test 2 Passed');
+    // Simulate teardown failure (e.g. Storage delete failed or object still exists)
+    tracker.cleanupFailure('uploads/test_artifact.jpg', new Error('Storage DELETE returned HTTP 500'));
+    const exitCode = tracker.printSummary();
+    assert.equal(exitCode, 1, 'Must return 1 when teardown fails');
+    assert.equal(tracker.cleanupFailures.length, 1);
+  });
+
+  it('StagingReportTracker must return 0 only when all tests pass with zero skips, zero config errors, and zero teardown failures', () => {
     const tracker = new StagingReportTracker();
     tracker.pass('Test 1 Passed');
     tracker.pass('Test 2 Passed');
     const exitCode = tracker.printSummary();
-    assert.equal(exitCode, 0, 'Must return 0 on 100% pass rate');
+    assert.equal(exitCode, 0, 'Must return 0 on 100% pass rate with clean teardown');
   });
 
   // --------------------------------------------------------------------------
-  // Group 4: RFC 6238 TOTP Generator Unit Tests
+  // Group 6: RFC 6238 TOTP Generator Unit Tests
   // --------------------------------------------------------------------------
   it('base32Decode must decode standard RFC Base32 strings and reject invalid input', () => {
     // RFC 4648 test vector: 'MZXW6YTBOI======' -> 'foobar'

@@ -35,6 +35,8 @@ const SERVICE_KEY = process.env.STAGING_SERVICE_ROLE_KEY || process.env.SUPABASE
 const ADMIN_EMAIL = process.env.STAGING_ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.STAGING_ADMIN_PASSWORD;
 const ADMIN_TOTP_SECRET = process.env.STAGING_ADMIN_TOTP_SECRET;
+const UNVERIFIED_MFA_TOKEN = process.env.STAGING_UNVERIFIED_MFA_TOKEN;
+const SUPABASE_JWT_SECRET = process.env.STAGING_SUPABASE_JWT_SECRET || process.env.SUPABASE_JWT_SECRET;
 
 // ----------------------------------------------------------------------------
 // Test Reporting State Machine
@@ -45,6 +47,7 @@ export class StagingReportTracker {
     this.failed = [];
     this.skipped = [];
     this.notConfigured = [];
+    this.cleanupFailures = [];
   }
 
   pass(name, details = '') {
@@ -67,19 +70,30 @@ export class StagingReportTracker {
     console.log(`⚠️  NOT CONFIGURED: ${variableName} (${description})`);
   }
 
+  cleanupFailure(resourceId, error) {
+    this.cleanupFailures.push({ resourceId, error: error.message || String(error) });
+    console.log(`💥 TEARDOWN FAILURE: ${resourceId} -> ${error.message || error}`);
+  }
+
   printSummary() {
     console.log('\n================================================================');
     console.log(' MG HOME CMS — Live Staging Verification Results Summary');
     console.log('================================================================');
-    console.log(`   PASS           : ${this.passed.length}`);
-    console.log(`   FAIL           : ${this.failed.length}`);
-    console.log(`   SKIPPED        : ${this.skipped.length}`);
-    console.log(`   NOT CONFIGURED : ${this.notConfigured.length}`);
+    console.log(`   PASS               : ${this.passed.length}`);
+    console.log(`   FAIL               : ${this.failed.length}`);
+    console.log(`   SKIPPED            : ${this.skipped.length}`);
+    console.log(`   NOT CONFIGURED     : ${this.notConfigured.length}`);
+    console.log(`   TEARDOWN FAILURES  : ${this.cleanupFailures.length}`);
     console.log('----------------------------------------------------------------');
 
     if (this.failed.length > 0) {
       console.log('\nFailed Tests:');
       this.failed.forEach((f, idx) => console.log(`   [${idx + 1}] ${f.name}\n       Error: ${f.error}`));
+    }
+
+    if (this.cleanupFailures.length > 0) {
+      console.log('\nTeardown / Cleanup Failures (Dangling Artifacts Detected!):');
+      this.cleanupFailures.forEach((c, idx) => console.log(`   [${idx + 1}] ${c.resourceId}\n       Error: ${c.error}`));
     }
 
     if (this.skipped.length > 0) {
@@ -96,6 +110,7 @@ export class StagingReportTracker {
       this.failed.length === 0 &&
       this.skipped.length === 0 &&
       this.notConfigured.length === 0 &&
+      this.cleanupFailures.length === 0 &&
       this.passed.length > 0;
 
     console.log('================================================================');
@@ -328,7 +343,7 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
         });
 
         const draftBody = await resDraft.text();
-        if (resDraft.status !== 403 && resDraft.status !== 400) {
+        if (resDraft.status !== 403) {
           throw new Error(`Expected HTTP 403 for AAL1 draft mutation, got HTTP ${resDraft.status}: ${draftBody}`);
         }
 
@@ -338,7 +353,7 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
           draftBody.includes('AAL2');
 
         if (!hasDeniedMessage) {
-          throw new Error(`Draft mutation rejected, but response did not contain required permission denial text: "${draftBody}"`);
+          throw new Error(`Draft mutation rejected with 403, but response did not contain required permission denial text: "${draftBody}"`);
         }
 
         tracker.pass('4. Authentic AAL1 Session Rejection (Verified HTTP 403 Permission Denial)');
@@ -539,27 +554,62 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
       const resNoAuth = await fetch(functionUrl, { method: 'POST' });
       if (resNoAuth.status !== 401) throw new Error(`Missing auth expected HTTP 401, got ${resNoAuth.status}`);
 
-      // 7b. AAL1 Token -> 403
+      // 7b. AAL1 Token -> 403 (Strict HTTP 403 Permission Denial)
       if (aal1Token) {
         const resAal1 = await fetch(functionUrl, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${aal1Token}` }
         });
-        if (resAal1.status !== 403) throw new Error(`AAL1 expected HTTP 403, got ${resAal1.status}`);
+        if (resAal1.status !== 403) {
+          throw new Error(`AAL1 expected HTTP 403, got HTTP ${resAal1.status}`);
+        }
+        const aal1Text = await resAal1.text();
+        if (!aal1Text.toLowerCase().includes('aal2') && !aal1Text.toLowerCase().includes('access denied')) {
+          throw new Error(`AAL1 rejection did not contain expected permission denial: "${aal1Text}"`);
+        }
       }
 
-      // 7c. AAL2 Session Without Verified TOTP Factor -> 403
-      // A forged JWT claim claiming aal2 for a user with zero verified TOTP factors must be rejected
-      const fakeAal2Header = { alg: 'HS256', typ: 'JWT' };
-      const fakeAal2Payload = { sub: '00000000-0000-0000-0000-000000000999', aal: 'aal2', role: 'authenticated' };
-      const unverifiedToken = `${Buffer.from(JSON.stringify(fakeAal2Header)).toString('base64url')}.${Buffer.from(JSON.stringify(fakeAal2Payload)).toString('base64url')}.invalidsig`;
+      // 7c. Real AAL2 Session Without Verified TOTP Factor -> 403
+      // Must use a cryptographically valid token signed by Supabase JWT secret
+      // or provided via STAGING_UNVERIFIED_MFA_TOKEN. A forged invalid-signature token is never used.
+      let unverifiedFactorToken = UNVERIFIED_MFA_TOKEN;
+      if (!unverifiedFactorToken && SUPABASE_JWT_SECRET) {
+        // Mint a cryptographically valid token for an identity lacking a verified TOTP factor
+        const unverifiedPayload = {
+          sub: '00000000-0000-0000-0000-000000000888',
+          aud: 'authenticated',
+          role: 'authenticated',
+          aal: 'aal2',
+          exp: Math.floor(Date.now() / 1000) + 3600
+        };
+        const b64Header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+        const b64Payload = Buffer.from(JSON.stringify(unverifiedPayload)).toString('base64url');
+        const signature = crypto.createHmac('sha256', SUPABASE_JWT_SECRET).update(`${b64Header}.${b64Payload}`).digest('base64url');
+        unverifiedFactorToken = `${b64Header}.${b64Payload}.${signature}`;
+      }
 
-      const resUnverified = await fetch(functionUrl, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${unverifiedToken}` }
-      });
-      if (resUnverified.status !== 401 && resUnverified.status !== 403) {
-        throw new Error(`Unverified factor session expected HTTP 401/403, got ${resUnverified.status}`);
+      if (unverifiedFactorToken) {
+        const resUnverified = await fetch(functionUrl, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${unverifiedFactorToken}` }
+        });
+
+        if (resUnverified.status !== 403) {
+          const errText = await resUnverified.text();
+          throw new Error(`AAL2 session without verified TOTP factor expected HTTP 403, got HTTP ${resUnverified.status}: ${errText}`);
+        }
+
+        const unverifiedText = await resUnverified.text();
+        const errLower = unverifiedText.toLowerCase();
+        if (!errLower.includes('totp') && !errLower.includes('factor') && !errLower.includes('access denied')) {
+          throw new Error(`Expected TOTP authorization denial error, got: "${unverifiedText}"`);
+        }
+      } else {
+        // Cannot safely execute this scenario in Staging without authentic unverified token or JWT secret
+        tracker.missingConfig(
+          'STAGING_UNVERIFIED_MFA_TOKEN',
+          'Cryptographically valid session token claiming AAL2 for an identity lacking a verified TOTP factor (or STAGING_SUPABASE_JWT_SECRET)'
+        );
       }
 
       if (aal2Token) {
@@ -622,7 +672,7 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
           throw new Error('Independent DB record fields did not match verified image properties.');
         }
 
-        // 7e. Spoofed Executable -> 422 + INDEPENDENT PROOF OF ZERO STORAGE OBJECT & ZERO DB RECORD
+        // 7e. Spoofed Executable -> 422 + COMPLETE PAGINATED STORAGE & DB VERIFICATION OF ZERO ARTIFACTS
         const fakeExe = new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]);
         const fakeExeName = `disguised_exe_${Date.now()}.jpg`;
         const exeForm = new FormData();
@@ -640,34 +690,70 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
 
         // INDEPENDENT VERIFICATION 3: Assert ZERO record exists in public.media_assets
         const checkDbRes = await fetch(
-          `${STAGING_URL}/rest/v1/media_assets?file_name=eq.${fakeExeName}`,
+          `${STAGING_URL}/rest/v1/media_assets?file_name=eq.${encodeURIComponent(fakeExeName)}`,
           { headers: { 'apikey': SERVICE_KEY, 'Authorization': `Bearer ${SERVICE_KEY}` } }
         );
+        if (!checkDbRes.ok) {
+          throw new Error(`DB verification query failed with HTTP ${checkDbRes.status}: ${await checkDbRes.text()}`);
+        }
         const checkDbData = await checkDbRes.json();
+        if (!Array.isArray(checkDbData)) {
+          throw new Error(`DB verification query returned non-array: ${JSON.stringify(checkDbData)}`);
+        }
         if (checkDbData.length > 0) {
           throw new Error('CRITICAL INTEGRITY FAILURE: Rejected executable was recorded in public.media_assets!');
         }
 
-        // INDEPENDENT VERIFICATION 4: Assert ZERO object exists in storage for disguised executable
-        const checkStorageRes = await fetch(
-          `${STAGING_URL}/storage/v1/object/list/media-library`,
-          {
-            method: 'POST',
-            headers: {
-              'apikey': SERVICE_KEY,
-              'Authorization': `Bearer ${SERVICE_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ prefix: 'uploads', limit: 100 })
+        // INDEPENDENT VERIFICATION 4: Assert ZERO object exists in storage via complete pagination
+        let storageOffset = 0;
+        const storageBatchSize = 100;
+        let hasMoreStorage = true;
+
+        while (hasMoreStorage) {
+          const checkStorageRes = await fetch(
+            `${STAGING_URL}/storage/v1/object/list/media-library`,
+            {
+              method: 'POST',
+              headers: {
+                'apikey': SERVICE_KEY,
+                'Authorization': `Bearer ${SERVICE_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ prefix: 'uploads', limit: storageBatchSize, offset: storageOffset })
+            }
+          );
+
+          if (!checkStorageRes.ok) {
+            throw new Error(`Storage list verification query failed with HTTP ${checkStorageRes.status}: ${await checkStorageRes.text()}`);
           }
-        );
-        const storageList = await checkStorageRes.json();
-        const foundFake = storageList.some((o) => o.name && o.name.includes(fakeExeName));
-        if (foundFake) {
-          throw new Error('CRITICAL STORAGE LEAK: Rejected executable was written to Storage despite 422 rejection!');
+
+          const storageList = await checkStorageRes.json();
+          if (!Array.isArray(storageList)) {
+            throw new Error(`Storage list returned non-array payload: ${JSON.stringify(storageList)}`);
+          }
+
+          const foundFake = storageList.some((o) => o.name && o.name.includes(fakeExeName));
+          if (foundFake) {
+            throw new Error(`CRITICAL STORAGE LEAK: Rejected executable "${fakeExeName}" was written to Storage despite 422 rejection!`);
+          }
+
+          if (storageList.length < storageBatchSize) {
+            hasMoreStorage = false;
+          } else {
+            storageOffset += storageBatchSize;
+          }
         }
 
-        tracker.pass('7. Live Edge Function HTTP Integration Suite (401, 403, 201 + Storage/DB Verification, 422 + Zero-Object Proof)');
+        // INDEPENDENT VERIFICATION 5: Direct lookup (must NOT be 200/201)
+        const exactCheckRes = await fetch(
+          `${STAGING_URL}/storage/v1/object/media-library/uploads/${fakeExeName}`,
+          { headers: { 'apikey': SERVICE_KEY, 'Authorization': `Bearer ${SERVICE_KEY}` } }
+        );
+        if (exactCheckRes.status === 200 || exactCheckRes.status === 201) {
+          throw new Error(`CRITICAL STORAGE LEAK: Direct lookup of rejected executable returned HTTP ${exactCheckRes.status}!`);
+        }
+
+        tracker.pass('7. Live Edge Function HTTP Integration Suite (401, 403, 201 + Storage/DB Verification, 422 + Complete Zero-Artifact Proof)');
       } else {
         tracker.skip('7. Live Edge Function HTTP Integration Suite', 'AAL2 token not acquired.');
       }
@@ -676,13 +762,13 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
     }
   } finally {
     // ------------------------------------------------------------------------
-    // HARDENED TEARDOWN: Runs even if tests fail, verifies HTTP success
+    // HARDENED TEARDOWN: Runs inside finally, tracks failures, performs post-delete checks
     // ------------------------------------------------------------------------
     if (createdTestAssets.length > 0) {
       console.log('\nExecuting hardened teardown of temporary test artifacts...');
       for (const asset of createdTestAssets) {
         try {
-          // Delete Storage Object
+          // 1. Delete Storage Object
           const delStorageRes = await fetch(`${STAGING_URL}/storage/v1/object/media-library`, {
             method: 'DELETE',
             headers: {
@@ -692,13 +778,24 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
             },
             body: JSON.stringify({ prefixes: [asset.path] })
           });
+
           if (!delStorageRes.ok) {
-            console.error(`❌ Teardown Storage deletion failed for "${asset.path}": ${delStorageRes.status} ${await delStorageRes.text()}`);
+            const errText = await delStorageRes.text();
+            tracker.cleanupFailure(asset.path, new Error(`Storage DELETE failed with HTTP ${delStorageRes.status}: ${errText}`));
           } else {
-            console.log(`   Deleted test storage object: ${asset.path}`);
+            console.log(`   Issued DELETE for storage object: ${asset.path}`);
           }
 
-          // Delete DB Row
+          // 2. Independent post-delete check for Storage: must not exist
+          const verifyStorageGone = await fetch(
+            `${STAGING_URL}/storage/v1/object/media-library/${asset.path}`,
+            { headers: { 'apikey': SERVICE_KEY, 'Authorization': `Bearer ${SERVICE_KEY}` } }
+          );
+          if (verifyStorageGone.status === 200 || verifyStorageGone.status === 201) {
+            tracker.cleanupFailure(asset.path, new Error(`Storage object still exists after DELETE request (HTTP ${verifyStorageGone.status})!`));
+          }
+
+          // 3. Delete DB Row
           const delDbRes = await fetch(`${STAGING_URL}/rest/v1/media_assets?id=eq.${asset.id}`, {
             method: 'DELETE',
             headers: {
@@ -706,13 +803,29 @@ export async function runStagingVerificationSuite(tracker = new StagingReportTra
               'Authorization': `Bearer ${SERVICE_KEY}`
             }
           });
+
           if (!delDbRes.ok) {
-            console.error(`❌ Teardown DB deletion failed for asset id "${asset.id}": ${delDbRes.status} ${await delDbRes.text()}`);
+            const errText = await delDbRes.text();
+            tracker.cleanupFailure(asset.id, new Error(`DB DELETE failed with HTTP ${delDbRes.status}: ${errText}`));
           } else {
-            console.log(`   Deleted test asset row: ${asset.id}`);
+            console.log(`   Issued DELETE for DB row: ${asset.id}`);
+          }
+
+          // 4. Independent post-delete check for DB: must return empty array
+          const verifyDbGone = await fetch(
+            `${STAGING_URL}/rest/v1/media_assets?id=eq.${asset.id}`,
+            { headers: { 'apikey': SERVICE_KEY, 'Authorization': `Bearer ${SERVICE_KEY}` } }
+          );
+          if (!verifyDbGone.ok) {
+            tracker.cleanupFailure(asset.id, new Error(`DB post-delete check query failed with HTTP ${verifyDbGone.status}`));
+          } else {
+            const remainingRows = await verifyDbGone.json();
+            if (Array.isArray(remainingRows) && remainingRows.length > 0) {
+              tracker.cleanupFailure(asset.id, new Error(`DB row still exists after DELETE request!`));
+            }
           }
         } catch (err) {
-          console.error(`❌ Teardown exception for test asset ${asset.path}:`, err.message);
+          tracker.cleanupFailure(asset.path || asset.id, err);
         }
       }
     }

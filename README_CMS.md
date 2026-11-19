@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.9 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.10 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.9: Staging Safety Closure & Strict Test Harness Hardening).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.10: Final Security Verification Corrections).
 
 ---
 
@@ -264,11 +264,12 @@ node --test tests/*.test.mjs
 - **Supabase Auth & Session Lifecycle (7 tests)**: Invalid credential rejection, AAL1 authentication & MFA factor detection, invalid TOTP code rejection, session upgrade to AAL2, `super_admin` role validation, non-admin rejection, session clearance on logout.
 - **Snapshot Publishing & Restoration Resiliency (8 tests)**: Publishing validation (zero sections, all hidden, missing phone, missing Arabic title), restoration resiliency against null, missing, or malformed fields.
 
-#### Category 4: Staging Safety Guards & Harness Unit Tests (12 tests)
+#### Category 4: Staging Safety Guards & Harness Unit Tests (15 tests)
 *File: `tests/staging_safety_and_harness.test.mjs`*
-- **Staging Allowlist & Anti-Production Guards (4 tests)**: Rejection of production project references, rejection of unknown arbitrary projects, strict enforcement of `STAGING_PROJECT_ALLOWLIST`, acceptance of valid staging/dev references.
-- **Codebase Static Asset Scanner Fail-Closed (2 tests)**: Fails closed when repository root is missing or unverified, protects full paths and basenames from `index.html`, `js/`, `css/`.
-- **Staging Report Tracker & Non-Zero Exit Code Policy (4 tests)**: Asserts exit code 1 when configurations are missing, asserts exit code 1 when any test is skipped, asserts exit code 1 when any test fails, asserts exit code 0 strictly on 100% pass rate.
+- **Staging Allowlist & Anti-Production Guards (3 tests)**: Rejection of production project references, rejection of unknown arbitrary projects, strict enforcement of `STAGING_PROJECT_ALLOWLIST`, acceptance of valid staging/dev references.
+- **Codebase Static Asset Scanner & Root Validation (3 tests)**: Fails closed when repository root is missing or unverified, fails closed when any of `index.html`, `package.json`, `supabase/`, `js/`, `css/`, or explicit required asset directories (`Img`, `Img-2`, `Img - 3`, `Logo`, `assets`) is missing, recursively scans and protects full paths and basenames.
+- **Strict Report Schema & Live Storage Comparison (2 tests)**: Validates complete schema `3.10`, enforces positive integer size, rejects missing/unknown mime types, rejects duplicate paths, compares full candidate sets against live storage (count, paths, sizes, and MIMEs).
+- **Staging Report Tracker, Teardown Integrity & Non-Zero Exit Code Policy (5 tests)**: Asserts exit code 1 when configurations are missing, asserts exit code 1 when any test is skipped, asserts exit code 1 when any test fails, asserts exit code 1 when teardown fails (dangling artifacts detected), asserts exit code 0 strictly on 100% pass rate with clean teardown.
 - **RFC 6238 TOTP Generator (2 tests)**: Validates base32 decoding against RFC 4648 test vector and rejects invalid characters, validates 6-digit numeric TOTP code generation consistency.
 
 ---
@@ -287,6 +288,7 @@ STAGING_SERVICE_ROLE_KEY=<service-role-secret> \
 STAGING_ADMIN_EMAIL=admin@mg-home.online \
 STAGING_ADMIN_PASSWORD=SecretPassword123! \
 STAGING_ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+STAGING_UNVERIFIED_MFA_TOKEN=<optional-aal2-token-without-totp> \
 node scripts/verify_staging_integration.mjs
 ```
 
@@ -294,18 +296,18 @@ This live script automatically executes:
 1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects` with explicit RLS error verification.
 2. **Anonymous Access Rejection**: Asserts unauthenticated requests to `is_admin_aal2()` return `false` and draft mutations fail.
 3. **Dropped RPC Non-Existence (HTTP 404)**: Confirms `validate_and_register_media_asset` is completely dropped from PostgreSQL.
-4. **Live AAL1 Session Rejection (HTTP 403)**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction` with verified permission denial message.
+4. **Live AAL1 Session Rejection (Strict HTTP 403)**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction` with verified HTTP 403 permission denial message (rejects generic HTTP 400).
 5. **Real TOTP Challenge & Authentic AAL2 Upgrade**: Generates real RFC 6238 TOTP 6-digit codes to verify MFA challenge and obtain authentic AAL2 JWT from Supabase GoTrue.
 6. **Authentic is_admin_aal2() Approval**: Confirms super_admin with verified AAL2 session returns `true`.
 7. **Complete 3-Table Snapshot ACID Rollback under Authentic Admin AAL2 Session**: Uses `display_order` to query sections, asserts `res.ok` on all baseline queries, submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws exception `22000` (`VALIDATION ERROR`), and verifies that all three draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) reverted to their baseline snapshots with zero partial mutation across all fields.
 8. **Live Edge Function HTTP Suite (`validate-image`)**:
    - Asserts HTTP 401 on missing auth.
-   - Asserts HTTP 403 on AAL1 session.
-   - Asserts HTTP 403 on unverified TOTP factor session.
+   - Asserts strict HTTP 403 on AAL1 session.
+   - Asserts strict HTTP 403 on authentic AAL2 session lacking verified TOTP factor (reports as NOT CONFIGURED if neither `STAGING_UNVERIFIED_MFA_TOKEN` nor `STAGING_SUPABASE_JWT_SECRET` is provisioned; never claims pass without real cryptographic proof).
    - Asserts HTTP 201 on valid JPEG upload, and performs independent GET verification directly from Storage and DB.
-   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and performs independent checks proving ZERO storage object and ZERO DB row created.
-9. **Hardened Teardown**: Runs in a `finally` block to ensure execution even on test failures, and verifies HTTP status of both Storage and Database deletions.
-10. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED` and exits with non-zero code if any test fails, is skipped, or is unconfigured.
+   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and performs complete paginated Storage scanning and direct lookup proving ZERO storage object and ZERO DB row created.
+9. **Hardened Teardown Integrity**: Runs inside a `finally` block to ensure execution, verifies HTTP status of deletions, executes independent post-delete queries to confirm both Storage object and DB record are absent, tracks cleanup failures in the report summary, and produces a non-zero exit code if cleanup fails.
+10. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED`, `TEARDOWN FAILURES` and exits with non-zero code (1) if any test fails, is skipped, is unconfigured, or fails teardown.
 
 ### 2. Manual Staging Verification Checklist
 Before production cutover, perform these physical verification steps on Staging:
