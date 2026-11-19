@@ -1,34 +1,31 @@
 #!/usr/bin/env node
 // ============================================================================
-// MG HOME CMS — Staging Orphaned Storage Objects Cleanup Tool (Phase 03.8 Hardened)
+// MG HOME CMS — Staging Orphaned Storage Objects Cleanup Tool (Phase 03.9 Hardened)
 // File: scripts/cleanup_orphaned_media.mjs
 // Run: node scripts/cleanup_orphaned_media.mjs [--dry-run|--delete --confirm-staging-project=<ref> --report=<report.json>]
 // ============================================================================
 //
 // MANDATORY SAFETY GUARDS:
-// 1. Strict Staging Project Allowlist:
-//    Rejects Production and arbitrary project references. Only allowed staging
-//    projects can proceed.
-// 2. Programmatic Confirmation:
-//    Requires matching --confirm-staging-project=<project-ref>.
-// 3. Recursive Storage Enumeration:
-//    Traverses all nested folders and subdirectories in media-library bucket.
-// 4. Deterministic Database Pagination:
-//    Uses order=storage_path.asc to ensure zero skipped or duplicated records.
-// 5. Codebase Static Asset Protection:
-//    Scans index.html, js/, css/, Img/ and protects both full paths and basenames.
-//    Fails closed if repository root cannot be verified.
-// 6. Report-Based Deletion Approval:
-//    Requires --report=<report.json>. Recomputes live candidate set and aborts
-//    if the live storage state has changed since report generation.
-// 7. Official Storage API Deletion:
+// 1. Mandatory Staging Project Allowlist:
+//    STAGING_PROJECT_ALLOWLIST is mandatory in ALL cases. No fuzzy fallback allowed.
+//    Rejects Production and unknown projects unconditionally.
+// 2. Recursive Codebase Scanning (fail-closed):
+//    Recursively scans index.html, js/, css/, Img/, Img-2/, Img - 3/, Logo/, assets/.
+//    Protects both full paths and basenames.
+// 3. Strict Full-Metadata Report Comparison:
+//    Requires --report=<report.json>. Validates schema, project_ref, target_url,
+//    and compares paths, sizes, and MIME types. Aborts if live storage changed.
+// 4. Recursive Storage Enumeration:
+//    Recursively enumerates all subdirectories in media-library bucket.
+// 5. Deterministic Database Pagination:
+//    Uses order=storage_path.asc to guarantee zero skipped records.
+// 6. Safe Storage API Deletion:
 //    Deletes via storage.from('media-library').remove([paths]).
 // ============================================================================
 
 import process from 'node:process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 // ----------------------------------------------------------------------------
 // Configuration & Environment Helpers
@@ -37,85 +34,123 @@ export function getCleanupConfig() {
   const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   const STAGING_PROJECT_ALLOWLIST = process.env.STAGING_PROJECT_ALLOWLIST
-    ? process.env.STAGING_PROJECT_ALLOWLIST.split(',').map((s) => s.trim().toLowerCase())
+    ? process.env.STAGING_PROJECT_ALLOWLIST.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
     : null;
 
   return { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, STAGING_PROJECT_ALLOWLIST };
 }
 
 // ----------------------------------------------------------------------------
-// SAFETY GUARD 1: Strict Staging Allowlist & Production Rejection
+// SAFETY GUARD 1: Mandatory Staging Allowlist & Absolute Production Rejection
 // ----------------------------------------------------------------------------
 export function validateStagingTarget(ref, allowlist) {
   if (!ref) {
     return { valid: false, error: 'Target project reference is empty.' };
   }
   const normalized = ref.toLowerCase();
-  // Absolute production rejection
+
+  // 1. Absolute production rejection
   if (normalized.includes('prod') || normalized.includes('production')) {
-    return { valid: false, error: `CRITICAL SAFETY VIOLATION: Target project "${ref}" appears to be Production! Execution blocked.` };
+    return {
+      valid: false,
+      error: `CRITICAL SAFETY VIOLATION: Target project "${ref}" appears to be Production! Execution strictly blocked.`
+    };
   }
 
-  // If explicit allowlist is provided, must be in allowlist
-  if (allowlist && allowlist.length > 0) {
-    if (!allowlist.includes(normalized)) {
-      return { valid: false, error: `SAFETY VIOLATION: Target project "${ref}" is not in the authorized STAGING_PROJECT_ALLOWLIST.` };
-    }
-    return { valid: true };
+  // 2. Mandatory Allowlist Check (No fuzzy fallback allowed!)
+  if (!allowlist || allowlist.length === 0) {
+    return {
+      valid: false,
+      error: 'CRITICAL CONFIGURATION ERROR: STAGING_PROJECT_ALLOWLIST is mandatory. You must explicitly set STAGING_PROJECT_ALLOWLIST to an approved list of staging project references.'
+    };
   }
 
-  // If no explicit allowlist provided, must have staging/stage/dev keyword
-  if (!normalized.includes('staging') && !normalized.includes('stage') && !normalized.includes('dev')) {
-    return { valid: false, error: `SAFETY VIOLATION: Target project "${ref}" is not recognized as a Staging environment. Set STAGING_PROJECT_ALLOWLIST to explicitly authorize.` };
+  if (!allowlist.includes(normalized)) {
+    return {
+      valid: false,
+      error: `SAFETY VIOLATION: Target project "${ref}" is not in the authorized STAGING_PROJECT_ALLOWLIST (${allowlist.join(', ')}).`
+    };
   }
 
   return { valid: true };
 }
 
 // ----------------------------------------------------------------------------
-// SAFETY GUARD 3: Fail-Closed Codebase Static Asset Scanner
+// SAFETY GUARD 2: Fail-Closed Recursive Codebase Static Asset Scanner
 // ----------------------------------------------------------------------------
 export function scanCodebaseProtectedAssets(rootDir = process.cwd()) {
   const indexHtmlPath = path.join(rootDir, 'index.html');
-  const jsDir = path.join(rootDir, 'js');
-  const cssDir = path.join(rootDir, 'css');
+  const requiredDirs = ['js', 'css'];
 
   // Verify repository root
-  if (!fs.existsSync(indexHtmlPath) || !fs.existsSync(jsDir) || !fs.existsSync(cssDir)) {
-    throw new Error('FAIL-CLOSED: Cannot verify repository root. Missing index.html, js/, or css/ directory.');
+  if (!fs.existsSync(indexHtmlPath)) {
+    throw new Error('FAIL-CLOSED: Cannot verify repository root. Missing index.html.');
+  }
+
+  for (const d of requiredDirs) {
+    if (!fs.existsSync(path.join(rootDir, d))) {
+      throw new Error(`FAIL-CLOSED: Cannot verify repository root. Missing "${d}" directory.`);
+    }
   }
 
   const protectedPaths = new Set();
   const protectedBasenames = new Set();
 
-  function scanFileContent(filePath) {
+  function scanTextFile(filePath) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
-      // Match URLs, file paths, image references
       const matches = content.match(/[\w\-./\\]+\.(?:webp|jpg|jpeg|png|svg|ico|gif)/gi) || [];
       for (const m of matches) {
         const normalized = m.replace(/\\/g, '/').replace(/^\/+/, '');
         protectedPaths.add(normalized);
-        protectedBasenames.add(path.basename(normalized));
+        protectedBasenames.add(path.basename(normalized).toLowerCase());
       }
     } catch (err) {
-      throw new Error(`FAIL-CLOSED: Failed reading codebase asset file "${filePath}": ${err.message}`);
+      throw new Error(`FAIL-CLOSED: Failed reading text asset file "${filePath}": ${err.message}`);
     }
   }
 
-  // Scan index.html
-  scanFileContent(indexHtmlPath);
-
-  // Scan js directory
-  const jsFiles = fs.readdirSync(jsDir).filter((f) => f.endsWith('.js'));
-  for (const jsFile of jsFiles) {
-    scanFileContent(path.join(jsDir, jsFile));
+  function scanDirectoryRecursive(dirPath) {
+    if (!fs.existsSync(dirPath)) return;
+    try {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          scanDirectoryRecursive(fullPath);
+        } else if (entry.isFile()) {
+          const ext = path.extname(entry.name).toLowerCase();
+          // If image file on disk, protect its relative path and basename
+          if (['.webp', '.jpg', '.jpeg', '.png', '.svg', '.ico', '.gif'].includes(ext)) {
+            const relPath = path.relative(rootDir, fullPath).replace(/\\/g, '/');
+            protectedPaths.add(relPath);
+            protectedBasenames.add(entry.name.toLowerCase());
+          }
+          // If code or style file, scan references inside it
+          if (['.js', '.css', '.html', '.json'].includes(ext)) {
+            scanTextFile(fullPath);
+          }
+        }
+      }
+    } catch (err) {
+      throw new Error(`FAIL-CLOSED: Failed scanning directory "${dirPath}": ${err.message}`);
+    }
   }
 
-  // Scan css directory
-  const cssFiles = fs.readdirSync(cssDir).filter((f) => f.endsWith('.css'));
-  for (const cssFile of cssFiles) {
-    scanFileContent(path.join(cssDir, cssFile));
+  // 1. Scan index.html
+  scanTextFile(indexHtmlPath);
+
+  // 2. Scan code directories recursively
+  scanDirectoryRecursive(path.join(rootDir, 'js'));
+  scanDirectoryRecursive(path.join(rootDir, 'css'));
+
+  // 3. Scan physical asset directories recursively
+  const assetDirs = ['Img', 'Img-2', 'Img - 3', 'Logo', 'assets'];
+  for (const ad of assetDirs) {
+    const fullDirPath = path.join(rootDir, ad);
+    if (fs.existsSync(fullDirPath)) {
+      scanDirectoryRecursive(fullDirPath);
+    }
   }
 
   return { protectedPaths, protectedBasenames };
@@ -131,8 +166,9 @@ export async function main() {
     console.error('\n❌ Missing required environment variables:');
     console.error('   - SUPABASE_URL (e.g. https://your-staging-ref.supabase.co)');
     console.error('   - SUPABASE_SERVICE_ROLE_KEY (service role secret)');
+    console.error('   - STAGING_PROJECT_ALLOWLIST (mandatory comma-separated staging project references)');
     console.error('\nUsage:');
-    console.error('   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node scripts/cleanup_orphaned_media.mjs [options]');
+    console.error('   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... STAGING_PROJECT_ALLOWLIST=... node scripts/cleanup_orphaned_media.mjs [options]');
     console.error('   Options:');
     console.error('     --dry-run (default: audits storage and exports candidate report)');
     console.error('     --delete --confirm-staging-project=<project-ref> --report=<report.json>\n');
@@ -160,7 +196,7 @@ export async function main() {
   const reportFilePath = reportArg ? reportArg.slice(reportArgPrefix.length) : '';
 
   console.log('================================================================');
-  console.log(' MG HOME CMS — Orphaned Storage Audit & Cleanup Tool (v3.8)');
+  console.log(' MG HOME CMS — Orphaned Storage Audit & Cleanup Tool (v3.9)');
   console.log('================================================================');
   console.log(`Target Supabase URL : ${SUPABASE_URL}`);
   console.log(`Target Project Ref  : ${projectRef}`);
@@ -194,12 +230,12 @@ export async function main() {
     'Content-Type': 'application/json'
   };
 
-  // Step 1: Scan codebase with fail-closed guarantee
-  console.log('Step 1: Scanning public codebase for referenced static assets (fail-closed)...');
+  // Step 1: Scan codebase with fail-closed guarantee (recursive)
+  console.log('Step 1: Recursively scanning public codebase and asset directories for protected assets...');
   let codebaseProtection;
   try {
     codebaseProtection = scanCodebaseProtectedAssets();
-    console.log(`   Found ${codebaseProtection.protectedPaths.size} path reference(s) and ${codebaseProtection.protectedBasenames.size} distinct filename(s).`);
+    console.log(`   Protected ${codebaseProtection.protectedPaths.size} path reference(s) and ${codebaseProtection.protectedBasenames.size} distinct filename(s).`);
   } catch (err) {
     console.error(`\n❌ ${err.message}`);
     process.exit(1);
@@ -296,7 +332,7 @@ export async function main() {
   // Step 4: Strict Classification of Storage Objects
   const classifiedItems = storageObjects.map((obj) => {
     const objPath = obj.name;
-    const baseName = path.basename(objPath);
+    const baseName = path.basename(objPath).toLowerCase();
 
     // 1. Database check
     if (registeredPaths.has(objPath) || registeredPaths.has(`uploads/${objPath}`)) {
@@ -331,7 +367,7 @@ export async function main() {
   const reportPath = path.resolve(reportOutputName);
 
   const reportPayload = {
-    schema_version: '3.8',
+    schema_version: '3.9',
     project_ref: projectRef,
     target_url: SUPABASE_URL,
     generated_at: new Date().toISOString(),
@@ -369,9 +405,9 @@ export async function main() {
   }
 
   // --------------------------------------------------------------------------
-  // SAFETY GUARD 4: Compare Against Approved Report Before Live Deletion
+  // SAFETY GUARD 3: Strict Full-Metadata Report Comparison Before Deletion
   // --------------------------------------------------------------------------
-  console.log('\nStep 6: Validating live candidates against previously approved report...');
+  console.log('\nStep 6: Performing comprehensive report validation & candidate set comparison...');
   let approvedReport;
   try {
     const rawReport = fs.readFileSync(path.resolve(reportFilePath), 'utf8');
@@ -381,38 +417,69 @@ export async function main() {
     process.exit(1);
   }
 
-  if (approvedReport.project_ref !== projectRef) {
-    console.error(`❌ Report project_ref "${approvedReport.project_ref}" does not match target "${projectRef}". Aborting.`);
+  // 1. Validate report schema version
+  if (!approvedReport.schema_version || approvedReport.schema_version !== '3.9') {
+    console.error(`❌ Report schema_version "${approvedReport.schema_version}" is incompatible (expected "3.9"). Aborting.`);
     process.exit(1);
   }
 
-  const approvedPaths = new Set(approvedReport.orphaned_candidates.map((c) => c.path));
-  const livePaths = new Set(candidateList.map((c) => c.name));
+  // 2. Validate project_ref
+  if (approvedReport.project_ref !== projectRef) {
+    console.error(`❌ Report project_ref "${approvedReport.project_ref}" does not match target project "${projectRef}". Aborting.`);
+    process.exit(1);
+  }
 
-  // Verify candidate sets are 100% identical
-  let hasDifference = approvedPaths.size !== livePaths.size;
-  if (!hasDifference) {
-    for (const p of livePaths) {
-      if (!approvedPaths.has(p)) {
-        hasDifference = true;
-        break;
-      }
+  // 3. Validate target_url
+  if (approvedReport.target_url !== SUPABASE_URL) {
+    console.error(`❌ Report target_url "${approvedReport.target_url}" does not match current SUPABASE_URL. Aborting.`);
+    process.exit(1);
+  }
+
+  // 4. Validate generated_at timestamp existence
+  if (!approvedReport.generated_at || isNaN(Date.parse(approvedReport.generated_at))) {
+    console.error('❌ Report generated_at timestamp is invalid or missing. Aborting.');
+    process.exit(1);
+  }
+
+  // 5. Compare full candidate metadata (path, size_bytes, mimetype)
+  const approvedMap = new Map();
+  for (const c of approvedReport.orphaned_candidates || []) {
+    approvedMap.set(c.path, c);
+  }
+
+  const liveMap = new Map();
+  for (const c of candidateList) {
+    liveMap.set(c.name, c);
+  }
+
+  if (approvedMap.size !== liveMap.size) {
+    console.error('\n🛑 SAFETY ABORT: Candidate count changed between audit and execution!');
+    console.error(`   Approved report count : ${approvedMap.size}`);
+    console.error(`   Current live count    : ${liveMap.size}`);
+    process.exit(1);
+  }
+
+  for (const [pathName, liveItem] of liveMap.entries()) {
+    const approvedItem = approvedMap.get(pathName);
+    if (!approvedItem) {
+      console.error(`\n🛑 SAFETY ABORT: Live storage contains new orphan "${pathName}" not in approved report!`);
+      process.exit(1);
+    }
+    if (approvedItem.size_bytes !== liveItem.size_bytes) {
+      console.error(`\n🛑 SAFETY ABORT: Object "${pathName}" size changed (report: ${approvedItem.size_bytes}, live: ${liveItem.size_bytes})!`);
+      process.exit(1);
+    }
+    if (approvedItem.mimetype !== liveItem.mimetype) {
+      console.error(`\n🛑 SAFETY ABORT: Object "${pathName}" mimetype changed (report: ${approvedItem.mimetype}, live: ${liveItem.mimetype})!`);
+      process.exit(1);
     }
   }
 
-  if (hasDifference) {
-    console.error('\n🛑 SAFETY ABORT: Live storage candidate set differs from approved report!');
-    console.error(`   Approved report candidates : ${approvedPaths.size}`);
-    console.error(`   Current live candidates    : ${livePaths.size}`);
-    console.error('   Storage state changed since the audit report was generated. Deletion cancelled.');
-    process.exit(1);
-  }
-
-  console.log(`   Verification successful: Live candidate set matches approved report 100% (${livePaths.size} objects).`);
+  console.log(`   Verification successful: Live candidate set matches approved report 100% on paths, sizes, and MIME types (${liveMap.size} objects).`);
 
   // Step 7: Batch Deletion via Storage API (.remove([paths]))
   console.log('\nStep 7: Executing safe batch deletion via Supabase Storage API...');
-  const pathsToDelete = Array.from(livePaths);
+  const pathsToDelete = Array.from(liveMap.keys());
   const deleteBatchSize = 100;
   let deletedCount = 0;
 

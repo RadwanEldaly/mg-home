@@ -1,6 +1,6 @@
-# MG HOME — Custom CMS & Visual Page Builder (Phase 03.8 Implementation)
+# MG HOME — Custom CMS & Visual Page Builder (Phase 03.9 Implementation)
 
-This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.8: Final Staging Safety & Verification Hardening).
+This repository contains the engineering implementation and security closure of the **MG HOME Custom CMS & Visual Page Builder** (v2.3.0 / Phase 03.9: Staging Safety Closure & Strict Test Harness Hardening).
 
 ---
 
@@ -137,21 +137,27 @@ WHERE bucket_id = 'media-library'
 
 #### Method A: Using the Hardened Staging Cleanup Tool
 A hardened, safe Node.js cleanup script is provided at [`scripts/cleanup_orphaned_media.mjs`](scripts/cleanup_orphaned_media.mjs) featuring:
-- **Full Pagination**: Fetches all storage objects and database records in batches without limits.
-- **Programmatic Anti-Production Guard**: Requires explicit `--confirm-staging-project=<project-ref>` matching the domain of `SUPABASE_URL`.
-- **Static Codebase Protection**: Scans `index.html` to protect referenced static assets (e.g. `Img/hero-bg.webp`) from being deleted.
-- **Candidate Report Export**: Exports `staging_orphaned_report_<timestamp>.json` prior to deletion.
+- **Mandatory Staging Allowlist**: `STAGING_PROJECT_ALLOWLIST` is strictly mandatory. Absolute rejection of Production and arbitrary project references with zero fuzzy fallback.
+- **Full Recursive Pagination**: Recursively traverses all nested folders in `media-library` with paginated retrieval.
+- **Deterministic Database Pagination**: Enforces `order=storage_path.asc` to guarantee zero skipped records.
+- **Recursive Codebase Static Asset Protection**: Recursively scans `index.html`, `js/`, `css/`, `Img/`, `assets/`, `Logo/` and protects both full paths and basenames. Fails closed if repository root cannot be verified.
+- **Strict Full-Metadata Report Comparison**: Requires `--report=<report.json>`. Validates `schema_version: '3.9'`, `project_ref`, `target_url`, and compares candidate paths, sizes, and MIME types. Aborts immediately if live storage changed.
 
 ```bash
 # Step 1: Run audit & generate candidate report (Dry Run - zero deletions)
 SUPABASE_URL=https://<staging-ref>.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
+STAGING_PROJECT_ALLOWLIST=<staging-ref> \
 node scripts/cleanup_orphaned_media.mjs
 
 # Step 2: Inspect generated JSON report, then execute safe deletion via Storage API
 SUPABASE_URL=https://<staging-ref>.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=<service-role-secret> \
-node scripts/cleanup_orphaned_media.mjs --delete --confirm-staging-project=<staging-ref>
+STAGING_PROJECT_ALLOWLIST=<staging-ref> \
+node scripts/cleanup_orphaned_media.mjs \
+  --delete \
+  --confirm-staging-project=<staging-ref> \
+  --report=staging_orphaned_report_<staging-ref>_<timestamp>.json
 ```
 
 #### Method B: Manual Supabase Storage API Deletion
@@ -288,17 +294,18 @@ This live script automatically executes:
 1. **Direct Storage Upload Rejection via PostgreSQL RLS**: Uses a **valid Anon Key** to prove that PostgreSQL RLS (and not a malformed API key) actively blocks client writes on `storage.objects` with explicit RLS error verification.
 2. **Anonymous Access Rejection**: Asserts unauthenticated requests to `is_admin_aal2()` return `false` and draft mutations fail.
 3. **Dropped RPC Non-Existence (HTTP 404)**: Confirms `validate_and_register_media_asset` is completely dropped from PostgreSQL.
-4. **Live AAL1 Session Rejection**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction`.
+4. **Live AAL1 Session Rejection (HTTP 403)**: Performs password login without TOTP, verifying that an authentic AAL1 session is rejected by `is_admin_aal2()` and `save_draft_page_transaction` with verified permission denial message.
 5. **Real TOTP Challenge & Authentic AAL2 Upgrade**: Generates real RFC 6238 TOTP 6-digit codes to verify MFA challenge and obtain authentic AAL2 JWT from Supabase GoTrue.
 6. **Authentic is_admin_aal2() Approval**: Confirms super_admin with verified AAL2 session returns `true`.
-7. **Real PostgreSQL ACID Rollback under Authentic Admin AAL2 Session**: Submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws an exception (`22000` / `VALIDATION ERROR`), and verifies that all three draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) reverted to their baseline snapshots with zero partial mutation.
+7. **Complete 3-Table Snapshot ACID Rollback under Authentic Admin AAL2 Session**: Uses `display_order` to query sections, asserts `res.ok` on all baseline queries, submits an invalid section payload under the Admin AAL2 session, asserts that PostgreSQL throws exception `22000` (`VALIDATION ERROR`), and verifies that all three draft tables (`draft_site_settings`, `draft_page_metadata`, `draft_page_sections`) reverted to their baseline snapshots with zero partial mutation across all fields.
 8. **Live Edge Function HTTP Suite (`validate-image`)**:
    - Asserts HTTP 401 on missing auth.
    - Asserts HTTP 403 on AAL1 session.
-   - Asserts HTTP 201 and asset registration on valid JPEG upload.
-   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and verifies zero storage object created.
-   - Cleans up only test artifacts created during the run.
-9. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED` and exits with non-zero code if any test fails, is skipped, or is unconfigured.
+   - Asserts HTTP 403 on unverified TOTP factor session.
+   - Asserts HTTP 201 on valid JPEG upload, and performs independent GET verification directly from Storage and DB.
+   - Asserts HTTP 422 on spoofed executable (`MZ` header disguised as image) and performs independent checks proving ZERO storage object and ZERO DB row created.
+9. **Hardened Teardown**: Runs in a `finally` block to ensure execution even on test failures, and verifies HTTP status of both Storage and Database deletions.
+10. **Strict Exit Code Policy**: Summarizes results into `PASS`, `FAIL`, `SKIPPED`, `NOT CONFIGURED` and exits with non-zero code if any test fails, is skipped, or is unconfigured.
 
 ### 2. Manual Staging Verification Checklist
 Before production cutover, perform these physical verification steps on Staging:

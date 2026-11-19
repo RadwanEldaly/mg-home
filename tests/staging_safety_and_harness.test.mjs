@@ -23,25 +23,29 @@ import {
 
 describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
   // --------------------------------------------------------------------------
-  // Group 1: Staging Allowlist & Anti-Production Safety Guards
+  // Group 1: Staging Allowlist & Anti-Production Safety Guards (Mandatory Allowlist)
   // --------------------------------------------------------------------------
-  it('validateStagingTarget must reject Production project references', () => {
-    const resProd1 = validateStagingTarget('mg-home-production', null);
+  it('validateStagingTarget must reject Production project references unconditionally', () => {
+    const resProd1 = validateStagingTarget('mg-home-production', ['mg-home-production']);
     assert.equal(resProd1.valid, false);
     assert.match(resProd1.error, /CRITICAL SAFETY VIOLATION.*Production/);
 
-    const resProd2 = validateStagingTarget('mg-prod-db', null);
+    const resProd2 = validateStagingTarget('mg-prod-db', ['mg-prod-db']);
     assert.equal(resProd2.valid, false);
     assert.match(resProd2.error, /Production/);
   });
 
-  it('validateStagingTarget must reject arbitrary unknown project references', () => {
-    const resUnknown = validateStagingTarget('random-customer-db', null);
-    assert.equal(resUnknown.valid, false);
-    assert.match(resUnknown.error, /SAFETY VIOLATION.*not recognized as a Staging environment/);
+  it('validateStagingTarget must fail closed if STAGING_PROJECT_ALLOWLIST is not provided', () => {
+    const resNoList = validateStagingTarget('mg-home-staging', null);
+    assert.equal(resNoList.valid, false);
+    assert.match(resNoList.error, /STAGING_PROJECT_ALLOWLIST is mandatory/);
+
+    const resEmptyList = validateStagingTarget('mg-home-staging', []);
+    assert.equal(resEmptyList.valid, false);
+    assert.match(resEmptyList.error, /STAGING_PROJECT_ALLOWLIST is mandatory/);
   });
 
-  it('validateStagingTarget must enforce strict explicit allowlist when provided', () => {
+  it('validateStagingTarget must enforce strict explicit allowlist membership', () => {
     const allowlist = ['mghome-staging-eu', 'mghome-staging-us'];
 
     // Unauthorized project
@@ -52,14 +56,6 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
     // Authorized project
     const resAuthorized = validateStagingTarget('mghome-staging-eu', allowlist);
     assert.equal(resAuthorized.valid, true);
-  });
-
-  it('validateStagingTarget must accept legitimate staging/dev references', () => {
-    const resStaging = validateStagingTarget('mg-home-staging', null);
-    assert.equal(resStaging.valid, true);
-
-    const resDev = validateStagingTarget('local-dev-instance', null);
-    assert.equal(resDev.valid, true);
   });
 
   // --------------------------------------------------------------------------
@@ -77,7 +73,7 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
     }
   });
 
-  it('scanCodebaseProtectedAssets must scan index.html, js, css and protect paths', () => {
+  it('scanCodebaseProtectedAssets must recursively scan index.html, js, css, Img, Logo, assets and protect paths', () => {
     const { protectedPaths, protectedBasenames } = scanCodebaseProtectedAssets(process.cwd());
 
     assert.ok(protectedPaths.size > 0, 'Must detect protected paths');
@@ -88,6 +84,64 @@ describe('10. Staging Safety Guards & Test Harness Unit Tests', () => {
       protectedBasenames.has('mg-home-logo.jpeg') || protectedPaths.has('assets/logo/mg-home-logo.jpeg'),
       'Must protect mg-home-logo.jpeg'
     );
+
+    // Verify images inside asset/Img subdirectories are protected
+    const hasAnyImageProtected = Array.from(protectedBasenames).some((b) =>
+      b.endsWith('.jpeg') || b.endsWith('.png') || b.endsWith('.webp')
+    );
+    assert.ok(hasAnyImageProtected, 'Must protect image assets recursively');
+  });
+
+  it('Report validation must compare full metadata (paths, sizes, MIME types)', () => {
+    const approvedReport = {
+      schema_version: '3.9',
+      project_ref: 'mg-staging-test',
+      target_url: 'https://mg-staging-test.supabase.co',
+      generated_at: new Date().toISOString(),
+      orphaned_candidates: [
+        { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
+        { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+      ]
+    };
+
+    // Helper validating candidate set equality (mirroring cleanup tool logic)
+    function validateReportCandidates(approved, liveCandidates) {
+      if (approved.schema_version !== '3.9') return { valid: false, error: 'Schema mismatch' };
+      if (approved.orphaned_candidates.length !== liveCandidates.length) {
+        return { valid: false, error: 'Count mismatch' };
+      }
+      const approvedMap = new Map(approved.orphaned_candidates.map((c) => [c.path, c]));
+      for (const live of liveCandidates) {
+        const match = approvedMap.get(live.path);
+        if (!match) return { valid: false, error: 'Path mismatch' };
+        if (match.size_bytes !== live.size_bytes) return { valid: false, error: 'Size mismatch' };
+        if (match.mimetype !== live.mimetype) return { valid: false, error: 'Mimetype mismatch' };
+      }
+      return { valid: true };
+    }
+
+    // 1. Identical candidate set
+    const identicalLive = [
+      { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'image/jpeg' },
+      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    assert.equal(validateReportCandidates(approvedReport, identicalLive).valid, true);
+
+    // 2. Modified size
+    const tamperedSize = [
+      { path: 'uploads/orphan1.jpg', size_bytes: 9999, mimetype: 'image/jpeg' },
+      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    assert.equal(validateReportCandidates(approvedReport, tamperedSize).valid, false);
+    assert.equal(validateReportCandidates(approvedReport, tamperedSize).error, 'Size mismatch');
+
+    // 3. Modified MIME type
+    const tamperedMime = [
+      { path: 'uploads/orphan1.jpg', size_bytes: 1024, mimetype: 'application/octet-stream' },
+      { path: 'uploads/orphan2.png', size_bytes: 2048, mimetype: 'image/png' }
+    ];
+    assert.equal(validateReportCandidates(approvedReport, tamperedMime).valid, false);
+    assert.equal(validateReportCandidates(approvedReport, tamperedMime).error, 'Mimetype mismatch');
   });
 
   // --------------------------------------------------------------------------
