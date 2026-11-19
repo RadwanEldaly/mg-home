@@ -44,38 +44,73 @@ CREATE TRIGGER trg_enforce_single_admin
     BEFORE INSERT ON public.admin_profiles
     FOR EACH ROW EXECUTE FUNCTION public.fn_enforce_single_admin();
 
--- Step 3.1: Official Supabase Auth Bootstrap Trigger for Initial Admin Profile
--- Seamlessly provisions the admin_profiles record when the super admin signs up
-CREATE OR REPLACE FUNCTION public.fn_handle_new_admin_user()
-RETURNS TRIGGER
+-- Step 3.1: Explicit Trusted Initial Admin Provisioning Procedure
+-- Replaces insecure automatic sign-up promotion triggers.
+-- Can ONLY be executed by service_role (CLI/Dashboard/Migrations).
+DROP TRIGGER IF EXISTS trg_on_auth_user_created ON auth.users;
+DROP FUNCTION IF EXISTS public.fn_handle_new_admin_user();
+
+CREATE OR REPLACE FUNCTION public.provision_initial_admin(
+    p_user_id UUID,
+    p_full_name TEXT DEFAULT 'System Administrator'
+)
+RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, public, pg_temp
+SET search_path = pg_catalog, public, auth, pg_temp
 AS $$
+DECLARE
+    v_user_email TEXT;
+    v_existing_count INT;
+    v_new_profile public.admin_profiles%ROWTYPE;
 BEGIN
-    IF (SELECT COUNT(*) FROM public.admin_profiles) = 0 THEN
-        INSERT INTO public.admin_profiles (
-            id,
-            full_name,
-            email,
-            role,
-            is_singleton
-        ) VALUES (
-            NEW.id,
-            COALESCE(NEW.raw_user_meta_data->>'full_name', 'System Administrator'),
-            NEW.email,
-            'super_admin',
-            true
-        );
+    -- 1. Enforce strict single-admin limit: if an admin already exists, abort immediately
+    SELECT COUNT(*) INTO v_existing_count FROM public.admin_profiles;
+    IF v_existing_count >= 1 THEN
+        RAISE EXCEPTION 'SINGLE ADMIN VIOLATION: An administrator profile already exists. Multiple administrators are prohibited.'
+            USING ERRCODE = '23505';
     END IF;
-    RETURN NEW;
+
+    -- 2. Verify that the target user ID exists in auth.users
+    SELECT email INTO v_user_email
+    FROM auth.users
+    WHERE id = p_user_id;
+
+    IF v_user_email IS NULL THEN
+        RAISE EXCEPTION 'USER NOT FOUND: Target user ID % does not exist in auth.users.', p_user_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    -- 3. Insert the single admin profile
+    INSERT INTO public.admin_profiles (
+        id,
+        full_name,
+        email,
+        role,
+        is_singleton,
+        created_at,
+        updated_at
+    ) VALUES (
+        p_user_id,
+        COALESCE(NULLIF(TRIM(p_full_name), ''), 'System Administrator'),
+        v_user_email,
+        'super_admin',
+        true,
+        TIMEZONE('utc', NOW()),
+        TIMEZONE('utc', NOW())
+    )
+    RETURNING * INTO v_new_profile;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'message', 'Initial administrator provisioned successfully.',
+        'admin_id', v_new_profile.id,
+        'email', v_new_profile.email,
+        'role', v_new_profile.role,
+        'created_at', v_new_profile.created_at
+    );
 END;
 $$;
-
-DROP TRIGGER IF EXISTS trg_on_auth_user_created ON auth.users;
-CREATE TRIGGER trg_on_auth_user_created
-    AFTER INSERT ON auth.users
-    FOR EACH ROW EXECUTE FUNCTION public.fn_handle_new_admin_user();
 
 -- Step 4: Draft Site Settings (Singleton row: id = 1)
 CREATE TABLE IF NOT EXISTS public.draft_site_settings (
@@ -944,7 +979,8 @@ $$;
 REVOKE ALL ON FUNCTION public.fn_set_updated_at() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.fn_prevent_singleton_deletion() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.fn_enforce_single_admin() FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.fn_handle_new_admin_user() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.provision_initial_admin(UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.provision_initial_admin(UUID, TEXT) TO service_role;
 REVOKE ALL ON FUNCTION public.fn_acquire_workspace_lock() FROM PUBLIC, anon, authenticated;
 
 REVOKE ALL ON FUNCTION public.is_admin_aal2() FROM PUBLIC, anon;
@@ -960,7 +996,7 @@ REVOKE ALL ON FUNCTION public.restore_revision_to_draft(UUID) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.restore_revision_to_draft(UUID) TO authenticated;
 
 REVOKE ALL ON FUNCTION public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.validate_and_register_media_asset(TEXT, TEXT, TEXT, TEXT, INTEGER, BYTEA, INTEGER, INTEGER, TEXT, TEXT, TEXT) TO authenticated, service_role;
 
 -- Step 21: Storage Bucket Configuration
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)

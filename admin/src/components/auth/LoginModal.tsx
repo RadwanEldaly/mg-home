@@ -4,15 +4,16 @@
 // ============================================================================
 
 import React, { useState } from 'react';
-import { useCMS } from '../../context/CMSContext';
-import { ShieldCheck, Lock, Mail, KeyRound, AlertCircle, Loader2 } from 'lucide-react';
+import { useCMS, type MFAEnrollmentData } from '../../context/CMSContext';
+import { ShieldCheck, Lock, Mail, KeyRound, AlertCircle, Loader2, QrCode, ArrowLeft, ArrowRight } from 'lucide-react';
 
 export const LoginModal: React.FC = () => {
   const { login, isAuthenticated, activeLanguage } = useCMS();
-  const [email, setEmail] = useState('admin@mg-home.online');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [totpCode, setTotpCode] = useState('');
-  const [step, setStep] = useState<'credentials' | 'mfa'>('credentials');
+  const [step, setStep] = useState<'credentials' | 'mfa' | 'enrollment'>('credentials');
+  const [enrollmentData, setEnrollmentData] = useState<MFAEnrollmentData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -26,19 +27,30 @@ export const LoginModal: React.FC = () => {
     setLoading(true);
 
     try {
-      const result = await login(email, password, step === 'mfa' ? totpCode : undefined);
+      const codeToSubmit = (step === 'mfa' || step === 'enrollment') ? totpCode : undefined;
+      const result = await login(email, password, codeToSubmit);
+
       if (result.success) {
-        // Logged in successfully
+        // Authenticated successfully with AAL2 session
       } else if (result.requiresMFA) {
         setStep('mfa');
+      } else if (result.requiresMFAEnrollment && result.enrollment) {
+        setEnrollmentData(result.enrollment);
+        setStep('enrollment');
       } else {
-        setError(result.error || (isAr ? 'بيانات الدخول غير صحيحة' : 'Invalid credentials'));
+        setError(result.error || (isAr ? 'بيانات الدخول غير صحيحة' : 'Invalid administrative credentials'));
       }
-    } catch {
-      setError(isAr ? 'حدث خطأ أثناء تسجيل الدخول' : 'An error occurred during authentication');
+    } catch (err: any) {
+      setError(err.message || (isAr ? 'حدث خطأ أثناء المصادقة' : 'An error occurred during authentication'));
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleBackToCredentials = () => {
+    setStep('credentials');
+    setTotpCode('');
+    setError(null);
   };
 
   return (
@@ -56,7 +68,9 @@ export const LoginModal: React.FC = () => {
             {isAr ? 'بوابة إدارة MG HOME CMS' : 'MG HOME CMS Portal'}
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            {isAr ? 'تسجيل دخول الإدارة المحمي بالمصادقة الثنائية (AAL2)' : 'Single Admin Authentication (AAL2 Enforced)'}
+            {step === 'credentials' && (isAr ? 'تسجيل دخول الإدارة المحمي بالمصادقة الثنائية (AAL2)' : 'Single Admin Authentication (AAL2 Enforced)')}
+            {step === 'mfa' && (isAr ? 'أدخل رمز التحقق الثنائي (TOTP)' : 'Enter 6-Digit Verification Code')}
+            {step === 'enrollment' && (isAr ? 'إعداد المصادقة الثنائية لأول مرة' : 'Setup Two-Factor Authentication')}
           </p>
         </div>
 
@@ -68,7 +82,7 @@ export const LoginModal: React.FC = () => {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          {step === 'credentials' ? (
+          {step === 'credentials' && (
             <>
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1.5">
@@ -104,7 +118,9 @@ export const LoginModal: React.FC = () => {
                 </div>
               </div>
             </>
-          ) : (
+          )}
+
+          {step === 'mfa' && (
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1.5">
                 {isAr ? 'رمز المصادقة الثنائية (TOTP 6-Digits):' : 'Enter 6-digit TOTP code:'}
@@ -128,6 +144,52 @@ export const LoginModal: React.FC = () => {
             </div>
           )}
 
+          {step === 'enrollment' && enrollmentData && (
+            <div className="space-y-3">
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-center">
+                <p className="text-xs text-slate-300 mb-2 font-medium">
+                  {isAr ? 'امسح رمز الاستجابة السريعة (QR) عبر تطبيق المصادقة:' : 'Scan this QR code with Google Authenticator:'}
+                </p>
+                {enrollmentData.qrCode ? (
+                  <img 
+                    src={enrollmentData.qrCode} 
+                    alt="MFA QR Code" 
+                    className="w-40 h-40 mx-auto rounded-lg bg-white p-2"
+                  />
+                ) : (
+                  <div className="w-40 h-40 mx-auto bg-slate-900 border border-slate-800 rounded-lg flex items-center justify-center text-slate-500">
+                    <QrCode className="w-8 h-8" />
+                  </div>
+                )}
+                {enrollmentData.secret && (
+                  <div className="mt-2 text-[11px] font-mono text-slate-400 break-all select-all">
+                    {isAr ? 'أو أدخل المفتاح يدويًا: ' : 'Manual Key: '}
+                    <span className="text-sky-400 font-bold">{enrollmentData.secret}</span>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                  {isAr ? 'أدخل الرمز الناتج من التطبيق للتأكيد:' : 'Enter code from authenticator to confirm:'}
+                </label>
+                <div className="relative">
+                  <KeyRound className="w-4 h-4 text-slate-500 absolute top-3 left-3 rtl:left-auto rtl:right-3" />
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    value={totpCode}
+                    onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-9 py-2.5 text-center font-mono tracking-widest text-lg text-sky-400 focus:outline-hidden focus:border-sky-500"
+                    placeholder="123456"
+                    autoFocus
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           <button
             type="submit"
             disabled={loading}
@@ -135,11 +197,22 @@ export const LoginModal: React.FC = () => {
           >
             {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
             <span>
-              {step === 'credentials' 
-                ? (isAr ? 'متابعة التحقق' : 'Continue to Studio') 
-                : (isAr ? 'تأكيد الرمز والدخول (AAL2)' : 'Verify Token & Enter')}
+              {step === 'credentials' && (isAr ? 'متابعة التحقق' : 'Continue to Studio')}
+              {step === 'mfa' && (isAr ? 'تأكيد الرمز والدخول (AAL2)' : 'Verify Token & Enter')}
+              {step === 'enrollment' && (isAr ? 'تفعيل المصادقة والدخول' : 'Activate MFA & Enter')}
             </span>
           </button>
+
+          {step !== 'credentials' && (
+            <button
+              type="button"
+              onClick={handleBackToCredentials}
+              className="w-full py-1.5 text-xs text-slate-400 hover:text-white flex items-center justify-center gap-1.5 transition-colors"
+            >
+              {isAr ? <ArrowRight className="w-3.5 h-3.5" /> : <ArrowLeft className="w-3.5 h-3.5" />}
+              <span>{isAr ? 'العودة لبيانات الدخول' : 'Back to login'}</span>
+            </button>
+          )}
         </form>
 
         <p className="text-[10px] text-slate-500 text-center mt-4">

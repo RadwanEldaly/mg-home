@@ -55,7 +55,7 @@ export const INITIAL_PAGE_METADATA: DraftPageMetadata = {
 export const INITIAL_SECTIONS: BaseSection[] = [
   // 1. HERO SECTION
   {
-    id: "sec-hero-01",
+    id: "a1000001-0000-4000-8000-000000000001",
     type: "hero",
     label: "قسم البطل (Hero Section)",
     order: 10,
@@ -113,7 +113,7 @@ export const INITIAL_SECTIONS: BaseSection[] = [
 
   // 2. SERVICES SECTION
   {
-    id: "sec-services-02",
+    id: "a1000002-0000-4000-8000-000000000002",
     type: "services",
     label: "شبكة الخدمات (Services Grid)",
     order: 20,
@@ -252,7 +252,7 @@ export const INITIAL_SECTIONS: BaseSection[] = [
 
   // 3. COPPER PIPING SECTION
   {
-    id: "sec-copper-03",
+    id: "a1000003-0000-4000-8000-000000000003",
     type: "copper",
     label: "تمديد وتأسيس النحاس (Copper Piping)",
     order: 30,
@@ -362,7 +362,7 @@ export const INITIAL_SECTIONS: BaseSection[] = [
 
   // 4. GALLERY SECTION
   {
-    id: "sec-gallery-04",
+    id: "a1000004-0000-4000-8000-000000000004",
     type: "gallery",
     label: "معرض الأعمال الميدانية (Photo Gallery)",
     order: 40,
@@ -465,7 +465,7 @@ export const INITIAL_SECTIONS: BaseSection[] = [
 
   // 5. CONTACT SECTION
   {
-    id: "sec-contact-05",
+    id: "a1000005-0000-4000-8000-000000000005",
     type: "contact",
     label: "التواصل ونموذج الطلب السريع (Contact & Form)",
     order: 50,

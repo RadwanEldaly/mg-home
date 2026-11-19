@@ -156,6 +156,37 @@ describe('1. Database Migration & Security Hardening Tests', () => {
     }
   });
 
+  it('Automatic signup promotion trigger must be dropped to prevent public registration privilege escalation', () => {
+    assert.match(
+      sql,
+      /DROP TRIGGER IF EXISTS trg_on_auth_user_created ON auth\.users;/i,
+      'Must drop signup auto-promotion trigger'
+    );
+    assert.match(
+      sql,
+      /DROP FUNCTION IF EXISTS public\.fn_handle_new_admin_user\(\);/i,
+      'Must drop auto-promotion trigger function'
+    );
+  });
+
+  it('provision_initial_admin function must be defined with service_role-only execution privilege', () => {
+    assert.match(
+      sql,
+      /CREATE OR REPLACE FUNCTION public\.provision_initial_admin\s*\(\s*p_user_id\s+UUID/i,
+      'Must define provision_initial_admin function'
+    );
+    assert.match(
+      sql,
+      /REVOKE ALL ON FUNCTION public\.provision_initial_admin\(UUID,\s*TEXT\)\s+FROM\s+PUBLIC,\s*anon,\s*authenticated;/i,
+      'Must revoke provision_initial_admin from PUBLIC, anon, authenticated'
+    );
+    assert.match(
+      sql,
+      /GRANT EXECUTE ON FUNCTION public\.provision_initial_admin\(UUID,\s*TEXT\)\s+TO\s+service_role;/i,
+      'Must grant provision_initial_admin ONLY to service_role'
+    );
+  });
+
   it('Page Revisions table must enforce strict non-empty snapshot schema', () => {
     assert.match(
       sql,

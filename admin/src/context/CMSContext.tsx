@@ -18,6 +18,131 @@ import {
 } from '../lib/initialData';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
+// Helper to decode JWT payload safely
+function parseJwtPayload(token: string): any {
+  try {
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    return JSON.parse(jsonPayload);
+  } catch {
+    return null;
+  }
+}
+
+// Database schema adapters (PostgreSQL snake_case <-> TypeScript camelCase)
+function toDbSection(sec: BaseSection) {
+  return {
+    id: sec.id,
+    section_type: sec.type,
+    section_label: sec.label,
+    display_order: sec.order,
+    is_visible: sec.isVisible,
+    anchor_id: sec.anchorId,
+    content: sec.content,
+    settings: sec.settings,
+    updated_at: new Date().toISOString()
+  };
+}
+
+function fromDbSection(row: any): BaseSection {
+  return {
+    id: row.id,
+    type: row.section_type,
+    label: row.section_label,
+    order: row.display_order,
+    isVisible: row.is_visible,
+    anchorId: row.anchor_id,
+    content: row.content || {},
+    settings: row.settings || { backgroundVariant: 'default', paddingTop: 'medium', paddingBottom: 'medium' }
+  };
+}
+
+function toDbSettings(s: DraftSiteSettings) {
+  return {
+    id: 1,
+    business_name_ar: s.businessNameAr,
+    business_name_en: s.businessNameEn,
+    local_phone: s.localPhone,
+    country_code: s.countryCode,
+    is_country_code_confirmed: s.isCountryCodeConfirmed,
+    instagram_url: s.instagramUrl,
+    instagram_handle: s.instagramHandle,
+    facebook_url: s.facebookUrl,
+    service_messages_ar: s.serviceMessagesAr,
+    service_messages_en: s.serviceMessagesEn,
+    updated_at: new Date().toISOString()
+  };
+}
+
+function fromDbSettings(row: any): DraftSiteSettings {
+  return {
+    businessNameAr: row.business_name_ar ?? INITIAL_SITE_SETTINGS.businessNameAr,
+    businessNameEn: row.business_name_en ?? INITIAL_SITE_SETTINGS.businessNameEn,
+    localPhone: row.local_phone ?? INITIAL_SITE_SETTINGS.localPhone,
+    countryCode: row.country_code ?? INITIAL_SITE_SETTINGS.countryCode,
+    isCountryCodeConfirmed: row.is_country_code_confirmed ?? true,
+    instagramUrl: row.instagram_url ?? INITIAL_SITE_SETTINGS.instagramUrl,
+    instagramHandle: row.instagram_handle ?? INITIAL_SITE_SETTINGS.instagramHandle,
+    facebookUrl: row.facebook_url ?? INITIAL_SITE_SETTINGS.facebookUrl,
+    serviceMessagesAr: row.service_messages_ar ?? INITIAL_SITE_SETTINGS.serviceMessagesAr,
+    serviceMessagesEn: row.service_messages_en ?? INITIAL_SITE_SETTINGS.serviceMessagesEn
+  };
+}
+
+function toDbMetadata(m: DraftPageMetadata) {
+  return {
+    id: 1,
+    slug: 'home',
+    title_ar: m.titleAr,
+    title_en: m.titleEn,
+    meta_description_ar: m.metaDescriptionAr,
+    meta_description_en: m.metaDescriptionEn,
+    og_image_url: m.ogImageUrl,
+    updated_at: new Date().toISOString()
+  };
+}
+
+function fromDbMetadata(row: any): DraftPageMetadata {
+  return {
+    slug: 'home',
+    titleAr: row.title_ar ?? INITIAL_PAGE_METADATA.titleAr,
+    titleEn: row.title_en ?? INITIAL_PAGE_METADATA.titleEn,
+    metaDescriptionAr: row.meta_description_ar ?? INITIAL_PAGE_METADATA.metaDescriptionAr,
+    metaDescriptionEn: row.meta_description_en ?? INITIAL_PAGE_METADATA.metaDescriptionEn,
+    ogImageUrl: row.og_image_url ?? INITIAL_PAGE_METADATA.ogImageUrl
+  };
+}
+
+function fromDbRevision(row: any): PageRevision {
+  const snap = row.snapshot_data || {};
+  return {
+    id: row.id,
+    revisionNumber: row.revision_number,
+    publishedAt: row.published_at,
+    publishedBy: row.published_by ? 'Super Admin' : 'System',
+    notes: row.notes || '',
+    isActive: row.is_active,
+    snapshotData: {
+      version: snap.version || '2.3.0',
+      publishedAt: snap.published_at || row.published_at,
+      siteSettings: snap.site_settings ? fromDbSettings(snap.site_settings) : INITIAL_SITE_SETTINGS,
+      pageMetadata: snap.page_metadata ? fromDbMetadata(snap.page_metadata) : INITIAL_PAGE_METADATA,
+      sections: Array.isArray(snap.sections) ? snap.sections.map(fromDbSection) : []
+    }
+  };
+}
+
+export interface MFAEnrollmentData {
+  qrCode: string;
+  secret: string;
+}
+
 interface CMSContextType {
   // Page Content & State
   sections: BaseSection[];
@@ -60,8 +185,14 @@ interface CMSContextType {
   isAuthenticated: boolean;
   adminEmail: string | null;
   aalLevel: 'aal1' | 'aal2';
-  login: (email: string, password: string, totpCode?: string) => Promise<{ success: boolean; requiresMFA?: boolean; error?: string }>;
-  logout: () => void;
+  login: (email: string, password: string, totpCode?: string) => Promise<{ 
+    success: boolean; 
+    requiresMFA?: boolean; 
+    requiresMFAEnrollment?: boolean; 
+    enrollment?: MFAEnrollmentData;
+    error?: string; 
+  }>;
+  logout: () => Promise<void>;
 }
 
 const CMSContext = createContext<CMSContextType | null>(null);
@@ -70,7 +201,6 @@ const STORAGE_KEY_SECTIONS = 'mg_cms_draft_sections_v2_3';
 const STORAGE_KEY_SETTINGS = 'mg_cms_draft_settings_v2_3';
 const STORAGE_KEY_METADATA = 'mg_cms_draft_metadata_v2_3';
 const STORAGE_KEY_REVISIONS = 'mg_cms_revisions_v2_3';
-const STORAGE_KEY_AUTH = 'mg_cms_auth_session_v2_3';
 
 export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Initial State from localStorage or default seed
@@ -132,16 +262,10 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [saveStatus, setSaveStatus] = useState<'saved' | 'modified' | 'saving'>('saved');
   const [isPublishing, setIsPublishing] = useState<boolean>(false);
 
-  // Authentication State
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(STORAGE_KEY_AUTH) === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [adminEmail, setAdminEmail] = useState<string | null>('admin@mg-home.online');
-  const [aalLevel, setAalLevel] = useState<'aal1' | 'aal2'>('aal2');
+  // Authentication State: strictly derived from verified Supabase session
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [adminEmail, setAdminEmail] = useState<string | null>(null);
+  const [aalLevel, setAalLevel] = useState<'aal1' | 'aal2'>('aal1');
 
   // History Stacks for Undo / Redo
   const undoStack = useRef<string[]>([]);
@@ -167,14 +291,132 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     localStorage.setItem(STORAGE_KEY_METADATA, JSON.stringify(pageMetadata));
   }, [sections, siteSettings, pageMetadata]);
 
-  // Select first section if none selected
-  useEffect(() => {
-    if (!selectedSectionId && sections.length > 0) {
-      setSelectedSectionId(sections[0].id);
-    }
-  }, [selectedSectionId, sections]);
+  // --------------------------------------------------------------------------
+  // Supabase Remote Draft Synchronization & Auth Session Lifecycle
+  // --------------------------------------------------------------------------
 
-  // Undo Handler
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+
+    let isCancelled = false;
+
+    // Load active draft and revisions from Supabase
+    async function loadRemoteState() {
+      try {
+        const [settingsRes, metaRes, secRes, revRes] = await Promise.all([
+          supabase!.from('draft_site_settings').select('*').eq('id', 1).maybeSingle(),
+          supabase!.from('draft_page_metadata').select('*').eq('id', 1).maybeSingle(),
+          supabase!.from('draft_page_sections').select('*').order('display_order', { ascending: true }),
+          supabase!.from('page_revisions').select('*').order('revision_number', { ascending: false })
+        ]);
+
+        if (isCancelled) return;
+
+        if (settingsRes.data) {
+          setSiteSettings(fromDbSettings(settingsRes.data));
+        }
+        if (metaRes.data) {
+          setPageMetadata(fromDbMetadata(metaRes.data));
+        }
+        if (secRes.data && secRes.data.length > 0) {
+          setSections(secRes.data.map(fromDbSection));
+        }
+        if (revRes.data && revRes.data.length > 0) {
+          setRevisions(revRes.data.map(fromDbRevision));
+        }
+      } catch (err) {
+        console.warn('[CMS] Failed to fetch remote draft, preserving local state:', err);
+      }
+    }
+
+    // Verify authenticated session and AAL2 status
+    async function verifySession() {
+      try {
+        const { data: { session }, error } = await supabase!.auth.getSession();
+        if (error || !session) {
+          setIsAuthenticated(false);
+          setAalLevel('aal1');
+          setAdminEmail(null);
+          return;
+        }
+
+        const payload = parseJwtPayload(session.access_token);
+        const isAal2 = payload?.aal === 'aal2';
+
+        if (!isAal2) {
+          setIsAuthenticated(false);
+          setAalLevel('aal1');
+          setAdminEmail(session.user.email || null);
+          return;
+        }
+
+        const { data: profile } = await supabase!
+          .from('admin_profiles')
+          .select('role, email')
+          .eq('id', session.user.id)
+          .maybeSingle();
+
+        if (profile && profile.role === 'super_admin') {
+          setIsAuthenticated(true);
+          setAalLevel('aal2');
+          setAdminEmail(profile.email || session.user.email || null);
+        } else {
+          setIsAuthenticated(false);
+          setAalLevel('aal1');
+          setAdminEmail(null);
+        }
+      } catch {
+        setIsAuthenticated(false);
+        setAalLevel('aal1');
+        setAdminEmail(null);
+      }
+    }
+
+    loadRemoteState();
+    verifySession();
+
+    // Listen to Supabase auth events
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (!session) {
+        setIsAuthenticated(false);
+        setAalLevel('aal1');
+        setAdminEmail(null);
+        return;
+      }
+
+      const payload = parseJwtPayload(session.access_token);
+      const isAal2 = payload?.aal === 'aal2';
+
+      if (isAal2) {
+        const { data: profile } = await supabase!
+          .from('admin_profiles')
+          .select('role, email')
+          .eq('id', session.user.id)
+          .maybeSingle();
+
+        if (profile && profile.role === 'super_admin') {
+          setIsAuthenticated(true);
+          setAalLevel('aal2');
+          setAdminEmail(profile.email || session.user.email || null);
+          return;
+        }
+      }
+
+      setIsAuthenticated(false);
+      setAalLevel(isAal2 ? 'aal2' : 'aal1');
+      setAdminEmail(session.user.email || null);
+    });
+
+    return () => {
+      isCancelled = true;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // History Operations (Undo / Redo)
+  // --------------------------------------------------------------------------
+
   const undo = useCallback(() => {
     if (undoStack.current.length === 0) return;
     const previous = undoStack.current.pop();
@@ -187,7 +429,6 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSaveStatus('modified');
   }, [sections]);
 
-  // Redo Handler
   const redo = useCallback(() => {
     if (redoStack.current.length === 0) return;
     const next = redoStack.current.pop();
@@ -201,26 +442,27 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [sections]);
 
   // --------------------------------------------------------------------------
-  // Section CRUD Operations
+  // Section Mutations
   // --------------------------------------------------------------------------
 
   const selectSection = useCallback((id: string | null) => {
     setSelectedSectionId(id);
   }, []);
 
-  const updateSiteSettings = useCallback((updates: Partial<DraftSiteSettings>) => {
-    setSiteSettings(prev => ({ ...prev, ...updates }));
+  const updateSiteSettings = useCallback((settings: Partial<DraftSiteSettings>) => {
+    setSiteSettings(prev => ({ ...prev, ...settings }));
     setSaveStatus('modified');
   }, []);
 
-  const updatePageMetadata = useCallback((updates: Partial<DraftPageMetadata>) => {
-    setPageMetadata(prev => ({ ...prev, ...updates }));
+  const updatePageMetadata = useCallback((metadata: Partial<DraftPageMetadata>) => {
+    setPageMetadata(prev => ({ ...prev, ...metadata }));
     setSaveStatus('modified');
   }, []);
 
   const addSection = useCallback((type: SectionType) => {
     pushHistorySnapshot();
-    const newId = `sec-${type}-${Date.now().toString(36)}`;
+    // Generate valid UUIDv4 for all sections
+    const newId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `a1000000-0000-4000-8000-${Date.now().toString().padStart(12, '0')}`;
     const highestOrder = sections.reduce((max, s) => Math.max(max, s.order), 0);
 
     let defaultContent: any = {};
@@ -299,52 +541,45 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               locationAr: "جدة — حي الروضة",
               locationEn: "Jeddah — Al-Rawdah",
               rating: 5,
-              commentAr: "صيانة مكيفات سبليت وحل مشكلة تسريب الفريون بشكل نهائي، فريق فني محترم وذو خبرة عالية.",
-              commentEn: "Fixed our split AC freon leak once and for all. Very respectful, skilled, and clean technician team.",
-              serviceTagAr: "صيانة سبليت",
-              serviceTagEn: "Split AC Repair"
+              commentAr: "تم إصلاح عطل غسالة ميتاج وتعبئة فريون مكيف دولابي في نفس الزيارة. فنيون محترفون وأسعار واضحة.",
+              commentEn: "Repaired Maytag washer and recharged standing AC freon in a single visit. Professional crew and transparent rates.",
+              serviceTagAr: "صيانة أجهزة",
+              serviceTagEn: "Appliance Repair"
             }
           ]
         };
         break;
 
       case 'text-image':
-        defaultLabel = "قصة المؤسسة ومعاييرنا (Text & Image)";
+        defaultLabel = "محتوى مع صورة (Text & Image)";
         defaultContent = {
           badgeAr: "عن MG HOME",
           badgeEn: "About MG HOME",
-          titleAr: "التزام تام بالجودة والسلامة الهندسية",
-          titleEn: "Uncompromising Quality & Engineering Safety",
-          descriptionAr: "منذ انطلاقنا في السوق السعودي، حرصنا على توفير أفضل معايير التبريد والتكييف مستعينين بكوادر فنية متمرسة، ومستخدمين خامات معتمدة تضمن استدامة الأداء لسنوات طويلة.",
-          descriptionEn: "Serving the Saudi market with top engineering standards, experienced technicians, and certified materials ensuring long-lasting performance.",
-          bulletsAr: [
-            "فريق فني متخصص مدرب على أحدث تقنيات الإنفرتر والدكت",
-            "استخدام معدات فحص إلكترونية وأجهزة قياس الضغط الرقمية"
-          ],
-          bulletsEn: [
-            "Specialized technical team certified in inverter and duct systems",
-            "Advanced digital manifold gauges and electronic leak detection"
-          ],
-          image: "assets/maintenance/ac-outdoor-lg-dual-inverter.jpeg",
-          imagePosition: "right",
-          buttonTextAr: "تواصل معنا للاستفسار",
-          buttonTextEn: "Contact Us Today",
-          buttonUrl: "#contact"
+          titleAr: "ريادة معتمدة في هندسة التكييف والتبريد",
+          titleEn: "Certified Excellence in HVAC & Refrigeration",
+          bodyAr: "نلتزم بأعلى المقاييس الفنية في تأسيس وصيانة أنظمة التكييف المركزي والمخفي والسبليت، ونوفر حلول صيانة الأجهزة المنزلية المتكاملة مع الفحص الميداني الدقيق واختبارات الجودة الصارمة.",
+          bodyEn: "We adhere to the highest engineering standards in rough-in and maintenance of central, concealed, and split AC systems, providing reliable appliance repairs with rigorous quality assurance.",
+          imageUrl: "assets/logo/mg-home-logo.jpeg",
+          imageAltAr: "شعار إم جي هوم لأعمال التكييف والصيانة",
+          imageAltEn: "MG HOME AC & Maintenance Logo",
+          imagePosition: "right"
         };
         break;
 
       default:
         defaultLabel = `قسم ${type}`;
-        defaultContent = { titleAr: `قسم جديد (${type})`, titleEn: `New Section (${type})` };
+        defaultContent = {};
+        break;
     }
 
+    const uniqueAnchor = `${type}-${Date.now().toString(36)}`;
     const newSection: BaseSection = {
       id: newId,
       type,
       label: defaultLabel,
       order: highestOrder + 10,
       isVisible: true,
-      anchorId: `${type}-${Date.now().toString(36).slice(-4)}`,
+      anchorId: uniqueAnchor,
       settings: {
         backgroundVariant: 'default',
         paddingTop: 'medium',
@@ -355,50 +590,44 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setSections(prev => [...prev, newSection]);
     setSelectedSectionId(newId);
+    setSaveStatus('modified');
   }, [sections, pushHistorySnapshot]);
 
   const deleteSection = useCallback((id: string) => {
-    if (sections.length <= 1) {
-      alert(activeLanguage === 'ar' ? 'لا يمكن حذف كافة الأقسام، يجب بقاء قسم واحد على الأقل.' : 'Cannot delete all sections. At least one must remain.');
-      return;
-    }
     pushHistorySnapshot();
-    setSections(prev => {
-      const filtered = prev.filter(s => s.id !== id);
-      if (selectedSectionId === id) {
-        setSelectedSectionId(filtered[0]?.id || null);
-      }
-      return filtered;
-    });
-  }, [sections, selectedSectionId, activeLanguage, pushHistorySnapshot]);
+    setSections(prev => prev.filter(s => s.id !== id));
+    if (selectedSectionId === id) setSelectedSectionId(null);
+    setSaveStatus('modified');
+  }, [selectedSectionId, pushHistorySnapshot]);
 
   const duplicateSection = useCallback((id: string) => {
     const target = sections.find(s => s.id === id);
     if (!target) return;
-    pushHistorySnapshot();
 
-    const cloneId = `sec-${target.type}-${Date.now().toString(36)}`;
-    const cloned: BaseSection = {
+    pushHistorySnapshot();
+    const newId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `a1000000-0000-4000-8000-${Date.now().toString().padStart(12, '0')}`;
+    const clone: BaseSection = {
       ...JSON.parse(JSON.stringify(target)),
-      id: cloneId,
+      id: newId,
       label: `${target.label} (نسخة)`,
-      anchorId: `${target.anchorId}-copy`,
+      anchorId: `${target.anchorId}-copy-${Date.now().toString(36)}`,
       order: target.order + 5
     };
 
-    const targetIndex = sections.findIndex(s => s.id === id);
-    const updated = [...sections];
-    updated.splice(targetIndex + 1, 0, cloned);
-
-    // Rebalance display orders monotonically
-    const reordered = updated.map((sec, idx) => ({ ...sec, order: (idx + 1) * 10 }));
-    setSections(reordered);
-    setSelectedSectionId(cloneId);
+    setSections(prev => {
+      const idx = prev.findIndex(s => s.id === id);
+      const next = [...prev];
+      next.splice(idx + 1, 0, clone);
+      return next.map((s, i) => ({ ...s, order: (i + 1) * 10 }));
+    });
+    setSelectedSectionId(newId);
+    setSaveStatus('modified');
   }, [sections, pushHistorySnapshot]);
 
   const toggleSectionVisibility = useCallback((id: string) => {
     pushHistorySnapshot();
     setSections(prev => prev.map(s => s.id === id ? { ...s, isVisible: !s.isVisible } : s));
+    setSaveStatus('modified');
   }, [pushHistorySnapshot]);
 
   const updateSection = useCallback((id: string, updates: Partial<BaseSection>) => {
@@ -409,12 +638,28 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const reorderSections = useCallback((newSections: BaseSection[]) => {
     pushHistorySnapshot();
     // Renumber display_order cleanly by tens: 10, 20, 30...
-    const monotonic = newSections.map((sec, index) => ({
+    const monotonic = newSections.map((sec, idx) => ({
       ...sec,
-      order: (index + 1) * 10
+      order: (idx + 1) * 10
     }));
     setSections(monotonic);
-  }, [pushHistorySnapshot]);
+    setSaveStatus('modified');
+
+    // If Supabase is connected and user is authenticated, sync order immediately via RPC
+    if (isSupabaseConfigured && supabase && isAuthenticated) {
+      const orderedIds = monotonic.map(s => s.id);
+      void (async () => {
+        try {
+          const { error } = await supabase.rpc('reorder_draft_sections', { p_ordered_ids: orderedIds });
+          if (error) {
+            console.error('[CMS] Reorder RPC error:', error.message);
+          }
+        } catch (err: any) {
+          console.error('[CMS] Reorder network error:', err);
+        }
+      })();
+    }
+  }, [pushHistorySnapshot, isAuthenticated]);
 
   // --------------------------------------------------------------------------
   // Draft & Publishing Operations
@@ -428,14 +673,47 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       localStorage.setItem(STORAGE_KEY_METADATA, JSON.stringify(pageMetadata));
 
       if (isSupabaseConfigured && supabase) {
-        // Update draft tables in Supabase
-        await supabase.from('draft_site_settings').update(siteSettings).eq('id', 1);
-        await supabase.from('draft_page_metadata').update(pageMetadata).eq('id', 1);
+        // 1. Persist site settings (snake_case)
+        const { error: errSettings } = await supabase
+          .from('draft_site_settings')
+          .upsert(toDbSettings(siteSettings));
+        if (errSettings) throw new Error(`Site settings error: ${errSettings.message}`);
+
+        // 2. Persist page metadata (snake_case)
+        const { error: errMetadata } = await supabase
+          .from('draft_page_metadata')
+          .upsert(toDbMetadata(pageMetadata));
+        if (errMetadata) throw new Error(`Page metadata error: ${errMetadata.message}`);
+
+        // 3. Persist draft page sections (handle deletes and upserts)
+        const { data: dbExisting, error: errFetch } = await supabase
+          .from('draft_page_sections')
+          .select('id');
+        if (errFetch) throw new Error(`Draft sections query error: ${errFetch.message}`);
+
+        const currentIds = new Set(sections.map(s => s.id));
+        const toDelete = (dbExisting || []).filter(r => !currentIds.has(r.id)).map(r => r.id);
+
+        if (toDelete.length > 0) {
+          const { error: errDel } = await supabase
+            .from('draft_page_sections')
+            .delete()
+            .in('id', toDelete);
+          if (errDel) throw new Error(`Failed to delete removed sections: ${errDel.message}`);
+        }
+
+        const sectionRows = sections.map((sec, idx) => toDbSection({ ...sec, order: (idx + 1) * 10 }));
+        if (sectionRows.length > 0) {
+          const { error: errUpsert } = await supabase
+            .from('draft_page_sections')
+            .upsert(sectionRows);
+          if (errUpsert) throw new Error(`Failed to persist draft sections: ${errUpsert.message}`);
+        }
       }
 
       setSaveStatus('saved');
       return true;
-    } catch (err) {
+    } catch (err: any) {
       console.error('[CMS] Save draft error:', err);
       setSaveStatus('modified');
       return false;
@@ -445,7 +723,15 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const publishRevision = useCallback(async (notes?: string) => {
     setIsPublishing(true);
     try {
-      await saveDraft();
+      // Must successfully persist all draft changes before publishing snapshot
+      const draftPersisted = await saveDraft();
+      if (!draftPersisted) {
+        setIsPublishing(false);
+        return { 
+          success: false, 
+          error: 'Cannot publish: Draft persistence to Supabase failed. Please check network and permissions.' 
+        };
+      }
 
       const newRevNumber = revisions.length + 1;
       const snapshot = {
@@ -466,7 +752,7 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         snapshotData: snapshot
       };
 
-      // Set other revisions to inactive
+      // Set other revisions to inactive locally
       const updatedRevisions = [
         newRevision,
         ...revisions.map(r => ({ ...r, isActive: false }))
@@ -480,6 +766,7 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           p_notes: notes || 'Published via Visual Page Builder'
         });
         if (error) throw error;
+        setIsPublishing(false);
         return { success: true, revisionNumber: data.revision_number };
       }
 
@@ -520,41 +807,136 @@ export const CMSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [revisions, pushHistorySnapshot]);
 
   // --------------------------------------------------------------------------
-  // Admin Authentication Operations
+  // Admin Authentication Operations (Supabase MFA / AAL2 Enforced)
   // --------------------------------------------------------------------------
 
   const login = useCallback(async (email: string, pass: string, totpCode?: string) => {
-    // If Supabase is connected, authenticate through Supabase Auth
-    if (isSupabaseConfigured && supabase) {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
-      if (error) return { success: false, error: error.message };
+    if (!isSupabaseConfigured || !supabase) {
+      return { 
+        success: false, 
+        error: 'Supabase is not configured. Please supply VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.' 
+      };
+    }
 
-      if (data.session) {
-        // Check for MFA challenge
-        const { data: aalData } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-        if (aalData && aalData.nextLevel === 'aal2' && !totpCode) {
+    try {
+      // 1. Password Authentication
+      let session = (await supabase.auth.getSession()).data.session;
+      if (!session || (email && pass)) {
+        const { data: signData, error: signError } = await supabase.auth.signInWithPassword({ 
+          email, 
+          password: pass 
+        });
+        if (signError) {
+          return { success: false, error: signError.message };
+        }
+        session = signData.session;
+      }
+
+      // 2. Query MFA Factors
+      const { data: factorsData, error: factorsError } = await supabase.auth.mfa.listFactors();
+      if (factorsError) {
+        return { success: false, error: `MFA Factor check error: ${factorsError.message}` };
+      }
+
+      const verifiedFactor = factorsData?.totp?.find(f => f.status === 'verified');
+
+      // 3. Challenge verified factor if present
+      if (verifiedFactor) {
+        if (!totpCode) {
           return { success: false, requiresMFA: true };
         }
+
+        const { error: verifyError } = await supabase.auth.mfa.challengeAndVerify({
+          factorId: verifiedFactor.id,
+          code: totpCode
+        });
+
+        if (verifyError) {
+          return { success: false, requiresMFA: true, error: `Invalid TOTP code: ${verifyError.message}` };
+        }
+      } else {
+        // 4. No verified TOTP factor: initiate enrollment flow
+        const unverified = factorsData?.totp?.find((f: any) => f.status === 'unverified');
+        let factorIdToVerify: string;
+        let qrCode = '';
+        let secret = '';
+
+        if (unverified && !totpCode) {
+          factorIdToVerify = unverified.id;
+        } else {
+          const { data: enrollData, error: enrollError } = await supabase.auth.mfa.enroll({
+            factorType: 'totp',
+            issuer: 'MG HOME CMS'
+          });
+
+          if (enrollError) {
+            return { success: false, error: `MFA Enrollment Failed: ${enrollError.message}` };
+          }
+
+          factorIdToVerify = enrollData.id;
+          qrCode = enrollData.totp.qr_code;
+          secret = enrollData.totp.secret;
+        }
+
+        if (!totpCode) {
+          return {
+            success: false,
+            requiresMFAEnrollment: true,
+            enrollment: { qrCode, secret }
+          };
+        }
+
+        // Verify the newly enrolled factor
+        const { error: verifyError } = await supabase.auth.mfa.challengeAndVerify({
+          factorId: factorIdToVerify,
+          code: totpCode
+        });
+
+        if (verifyError) {
+          return {
+            success: false,
+            requiresMFAEnrollment: true,
+            enrollment: { qrCode, secret },
+            error: `Invalid TOTP verification code: ${verifyError.message}`
+          };
+        }
       }
-    }
 
-    // Default administrative authentication flow
-    if (email === 'admin@mg-home.online' || email === 'radwaneldaly14@gmail.com') {
+      // 5. Verify user profile has super_admin role
+      const user = (await supabase.auth.getUser()).data.user;
+      if (!user) {
+        return { success: false, error: 'User session not found.' };
+      }
+
+      const { data: profile, error: profError } = await supabase
+        .from('admin_profiles')
+        .select('role, email')
+        .eq('id', user.id)
+        .maybeSingle();
+
+      if (profError || !profile || profile.role !== 'super_admin') {
+        await supabase.auth.signOut();
+        return { 
+          success: false, 
+          error: 'Access Denied: Your account does not have super_admin privileges in admin_profiles.' 
+        };
+      }
+
       setIsAuthenticated(true);
-      setAdminEmail(email);
       setAalLevel('aal2');
-      localStorage.setItem(STORAGE_KEY_AUTH, 'true');
+      setAdminEmail(profile.email || user.email || null);
       return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Authentication error occurred.' };
     }
-
-    return { success: false, error: 'Invalid administrative credentials' };
   }, []);
 
-  const logout = useCallback(() => {
+  const logout = useCallback(async () => {
     setIsAuthenticated(false);
-    localStorage.removeItem(STORAGE_KEY_AUTH);
+    setAalLevel('aal1');
+    setAdminEmail(null);
     if (isSupabaseConfigured && supabase) {
-      supabase.auth.signOut();
+      await supabase.auth.signOut();
     }
   }, []);
 
